@@ -25,12 +25,13 @@
 #include <psp2kern/io/stat.h>
 #include <psp2kern/udcd.h>
 #include <psp2kern/ctrl.h>
+#include <psp2kern/power.h>
 #include <stdarg.h>
 #include "usb_descriptors.h"
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.2.1"
+#define VDB_VERSION		"0.2.2"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -76,6 +77,7 @@ enum
 	VDB_CMD_REMOVE		= 10,
 	VDB_CMD_RMDIR		= 11,
 	VDB_CMD_RENAME		= 12,	// payload: "old\0new\0"
+	VDB_CMD_POWER		= 13,	// arg: 0 cold reboot, 1 soft reboot, 2 power off, 3 suspend; replies, then acts 300 ms later
 };
 
 typedef struct
@@ -495,6 +497,26 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 		unsigned nFirst = strlen( pszPath );
 		const char *pszNew = nFirst + 1 < nPayload ? pszPath + nFirst + 1 : "";
 		SendReply( VDB_CMD_RENAME, ksceIoRename( pszPath, pszNew ), 0 );
+		break;
+	}
+	case VDB_CMD_POWER:
+	{
+		// reply first (the host waits for it), then act once the reply is on
+		// the wire: a reboot from the Mac closes the edit-build-install loop
+		// without touching the Vita, and the plugin can replace itself
+		static const char *s_pszActions[] = { "cold reboot", "soft reboot", "power off", "suspend" };
+		if ( hdr.arg > 3 )
+		{
+			SendReply( VDB_CMD_POWER, -2, 0 );
+			break;
+		}
+		PutAbort();
+		Log( "vdb: %s requested by the host", s_pszActions[hdr.arg] );
+		SendReply( VDB_CMD_POWER, 0, 0 );
+		ksceKernelDelayThread( 300 * 1000 );
+		int ret = hdr.arg == 0 ? kscePowerRequestColdReset() : hdr.arg == 1 ? kscePowerRequestSoftReset()
+			: hdr.arg == 2 ? kscePowerRequestStandby() : kscePowerRequestSuspend();
+		Log( "vdb: %s request returned 0x%08x", s_pszActions[hdr.arg], ret );
 		break;
 	}
 	default:

@@ -12,6 +12,7 @@
   vdb.py rm ux0:data/x.bin
   vdb.py rmdir ux0:data/dir
   vdb.py mv ux0:data/a ux0:data/b
+  vdb.py reboot                    cold reboot (also: reboot soft, poweroff, suspend)
 
 `logs` and the other commands use different USB interfaces, so a log tail can
 stay attached in one terminal while files move in another.
@@ -38,7 +39,8 @@ HDR = struct.Struct("<IIII")   # cmd: magic, cmd, len, arg; rsp: magic, cmd, sta
 RSP = struct.Struct("<IIiI")
 
 (CMD_PING, CMD_STATUS, CMD_LIST, CMD_STAT, CMD_GET, CMD_PUT_OPEN, CMD_PUT_DATA,
- CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME) = range(1, 13)
+ CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME, CMD_POWER) = range(1, 14)
+POWER_ACTIONS = {"reboot": 0, "soft": 1, "poweroff": 2, "suspend": 3}
 
 RX_SIZE_OLD = 4096             # the command buffer of vdb 0.2 (no "rx" in its status line)
 DATA_CHUNK = 32 * 1024
@@ -229,6 +231,15 @@ def main():
         check(b.simple(CMD_RMDIR, path_arg(rest[0]))[0], f"rmdir {rest[0]}")
     elif cmd == "mv" and len(rest) == 2:
         check(b.simple(CMD_RENAME, path_arg(rest[0]) + path_arg(rest[1]))[0], f"mv {rest[0]}")
+    elif cmd in ("reboot", "poweroff", "suspend") and len(rest) <= 1:
+        action = "soft" if (cmd == "reboot" and rest == ["soft"]) else cmd
+        if action not in POWER_ACTIONS:
+            print(__doc__)
+            return 1
+        b.send(CMD_POWER, arg=POWER_ACTIONS[action])
+        _, status, _ = b.reply()
+        check(status, action)
+        print(f"{action} requested; the Vita leaves the bus in a moment")
     else:
         print(__doc__)
         return 1
