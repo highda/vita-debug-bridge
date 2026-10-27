@@ -117,17 +117,34 @@ def check(status, what):
 
 
 def logs():
-    dev = open_device(0)
-    print("vdb: attached, waiting for log data (ctrl-c to stop)", file=sys.stderr)
+    """Tail the ring; when the Vita leaves the bus (reboot, sleep, cable) wait
+    for it to come back and attach again, so one recorder covers a whole
+    session of reboots."""
+    dev = None
     buf = b""
     while True:
+        if dev is None:
+            while usb.core.find(idVendor=VID, idProduct=PID) is None:
+                time.sleep(1)
+            try:
+                dev = open_device(0)
+            except (usb.core.USBError, SystemExit):
+                time.sleep(1)
+                continue
+            buf = b""
+            print(f"vdb: attached {time.strftime('%H:%M:%S')}, waiting for log data (ctrl-c to stop)", file=sys.stderr)
         try:
             data = dev.read(EP_IN, 4096, timeout=2000)
         except usb.core.USBTimeoutError:
             continue
         except usb.core.USBError as e:
-            print(f"usb error: {e}", file=sys.stderr)
-            time.sleep(0.5)
+            print(f"vdb: usb error ({e}), waiting for the Vita to come back", file=sys.stderr)
+            try:
+                usb.util.dispose_resources(dev)
+            except Exception:
+                pass
+            dev = None
+            time.sleep(1)
             continue
         buf += bytes(data)
         while b"\n" in buf:

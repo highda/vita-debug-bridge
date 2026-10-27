@@ -26,12 +26,13 @@
 #include <psp2kern/udcd.h>
 #include <psp2kern/ctrl.h>
 #include <psp2kern/power.h>
+#include <psp2kern/kernel/suspend.h>
 #include <stdarg.h>
 #include "usb_descriptors.h"
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.2.2"
+#define VDB_VERSION		"0.2.3"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -659,8 +660,15 @@ static int UsbThread( SceSize args, void *argp )
 		{
 			bits = 0;
 			if ( ++nTicks % 25 == 0 )
+			{
 				Log( "vdb: alive %u (uptime %u s, ring %u used, dropped %u, host %s)", ++nBeats,
 					(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), s_nRingWrite - s_nRingRead, s_nDropped, bConnected ? "attached" : "none" );
+				// Keep the screen on and the Vita awake while the bridge is
+				// up: a Vita that locked itself went unreachable over USB
+				// more than once in the middle of a test session
+				if ( s_bActive )
+					ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
+			}
 			SceCtrlData pad;
 			memset( &pad, 0, sizeof( pad ) );
 			if ( ksceCtrlPeekBufferPositive( 0, &pad, 1 ) > 0 )

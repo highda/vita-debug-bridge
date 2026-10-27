@@ -18,6 +18,7 @@ A taiHEN **kernel plugin** (`vdb.skprx`) that turns the PS Vita's USB port into 
 - **logs stream live over USB** while the game runs: the plugin keeps a 64 KB kernel log ring that any app can write to with one syscall (`vdb_write`); the host tails it. A game that mirrors its debug log into it has its loads, frame statistics, slow reads and crashes arrive on the computer as they happen, no card round trips;
 - **files move over the same cable** while the game runs: `vdb.py ls / stat / get / put / mkdir / rm / rmdir / mv` on any path the kernel can see (`ux0:`, `ur0:`, `uma0:`, `imc0:`, `vs0:`, `os0:` and the rest; the system partitions are yours to break). The commands go on a second bulk pipe, the replies and file data come back on a third, so no app on the Vita is involved and no USB mode switch is needed;
 - **the Vita reboots or powers off from the computer**: `vdb.py reboot` (cold; `reboot soft`, `poweroff`, `suspend` too). With `put` over `ux0:vdbplugin/vdb.skprx` the plugin replaces itself and reboots into the new build without a hand on the Vita;
+- **the Vita stays awake** while the bridge is up (a power tick every 5 s): a self-locked Vita went unreachable over USB mid-session more than once;
 - **hotkeys** work without any app: `L + R + Start + Select` toggles the bridge (take the USB port / give it back to the system), `L + R + Start + Up` writes a status line to `ux0:vdbplugin/boot.txt`.
 
 The log pipe and the command pipe are on separate USB interfaces, so a log tail in one terminal keeps running while files move in another.
