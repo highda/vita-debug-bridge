@@ -31,12 +31,14 @@
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <psp2kern/appmgr.h>
 #include <psp2kern/display.h>
+#include <psp2/touch.h>
+#include <taihen.h>
 #include <stdarg.h>
 #include "usb_descriptors.h"
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.3.2"
+#define VDB_VERSION		"0.3.3"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -85,6 +87,7 @@ enum
 	VDB_CMD_LAUNCH		= 14,	// payload: "path\0args\0..."; reply payload: 4-byte pid
 	VDB_CMD_KILL		= 15,	// arg: pid (0 = the process that owns the screen); reply payload: 4-byte pid
 	VDB_CMD_SCREEN		= 16,	// reply: VdbScreenHdr_t, then the raw framebuffer in frames, then an empty frame
+	VDB_CMD_TOUCH		= 18,	// payload: VdbTouch_t; a finger from (x0,y0) to (x1,y1) over ms milliseconds (screen pixels, 960x544)
 	VDB_CMD_INPUT		= 17,	// payload: VdbInput_t; held for hold_ms, then released
 	VDB_CMD_POWER		= 13,	// arg: 0 cold reboot, 1 soft reboot, 2 power off, 3 suspend; replies, then acts 300 ms later
 };
@@ -118,6 +121,18 @@ typedef struct
 // needs refreshing), then released once
 static VdbInput_t s_Input;
 static unsigned long long s_nInputUntil;	// system time, 0 = nothing held
+
+typedef struct
+{
+	unsigned short x0, y0, x1, y1;	// screen pixels
+	unsigned ms;
+} VdbTouch_t;
+
+// Injected front-panel finger, seen by every reader of the touch panel
+// through taiHEN hooks on the kernel touch functions (as ds4vita does);
+// the position moves linearly from (x0,y0) to (x1,y1) over the duration
+static VdbTouch_t s_Touch;
+static unsigned long long s_nTouchStart, s_nTouchUntil;
 
 static char s_Ring[RING_SIZE];
 static unsigned s_nRingWrite, s_nRingRead;	// monotonic byte counters; valid = write - read
@@ -445,6 +460,87 @@ static void CmdPutClose( void )
 	SendReply( VDB_CMD_PUT_CLOSE, nStatus, 8 );
 }
 
+//-----------------------------------------------------------------------------
+// Touch injection hooks
+//-----------------------------------------------------------------------------
+static tai_hook_ref_t s_TouchRef[4];
+static SceUID s_TouchHook[4] = { -1, -1, -1, -1 };
+
+static void PatchTouch( SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs )
+{
+	if ( port != SCE_TOUCH_PORT_FRONT || !s_nTouchUntil || !pData )
+		return;
+	unsigned long long now = ksceKernelGetSystemTimeWide();
+	if ( now >= s_nTouchUntil )
+	{
+		s_nTouchUntil = 0;	// the finger lifts: the next reads carry no report
+		return;
+	}
+	unsigned nElapsed = (unsigned)( now - s_nTouchStart ), nTotal = s_Touch.ms * 1000;
+	if ( nTotal == 0 )
+		nTotal = 1;
+	int x = (int)s_Touch.x0 + (int)( (int)s_Touch.x1 - (int)s_Touch.x0 ) * (int)( nElapsed / 1000 ) / (int)( nTotal / 1000 );
+	int y = (int)s_Touch.y0 + (int)( (int)s_Touch.y1 - (int)s_Touch.y0 ) * (int)( nElapsed / 1000 ) / (int)( nTotal / 1000 );
+	for ( SceUInt32 i = 0; i < nBufs; i++ )
+	{
+		pData[i].report[0].id = 0;
+		pData[i].report[0].force = 128;
+		pData[i].report[0].x = (unsigned short)( x * 2 );	// panel is 1920x1088 for a 960x544 screen
+		pData[i].report[0].y = (unsigned short)( y * 2 );
+		pData[i].reportNum = 1;
+	}
+}
+
+static int Hook_ksceTouchPeek( SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs )
+{
+	int ret = TAI_CONTINUE( int, s_TouchRef[0], port, pData, nBufs );
+	if ( ret >= 0 )
+		PatchTouch( port, pData, nBufs );
+	return ret;
+}
+static int Hook_ksceTouchPeekRegion( SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs, int region )
+{
+	int ret = TAI_CONTINUE( int, s_TouchRef[1], port, pData, nBufs, region );
+	if ( ret >= 0 )
+		PatchTouch( port, pData, nBufs );
+	return ret;
+}
+static int Hook_ksceTouchRead( SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs )
+{
+	int ret = TAI_CONTINUE( int, s_TouchRef[2], port, pData, nBufs );
+	if ( ret >= 0 )
+		PatchTouch( port, pData, nBufs );
+	return ret;
+}
+static int Hook_ksceTouchReadRegion( SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs, int region )
+{
+	int ret = TAI_CONTINUE( int, s_TouchRef[3], port, pData, nBufs, region );
+	if ( ret >= 0 )
+		PatchTouch( port, pData, nBufs );
+	return ret;
+}
+
+// NIDs as in ds4vita (3.60/3.65 SceTouch): Peek, PeekRegion, Read, ReadRegion
+static void InstallTouchHooks( void )
+{
+	static const unsigned s_Nids[4] = { 0xBAD1960B, 0x9B3F7207, 0x70C8AACE, 0x9A91F624 };
+	static const void *s_Fns[4] = { Hook_ksceTouchPeek, Hook_ksceTouchPeekRegion, Hook_ksceTouchRead, Hook_ksceTouchReadRegion };
+	for ( int i = 0; i < 4; i++ )
+	{
+		s_TouchHook[i] = taiHookFunctionExportForKernel( KERNEL_PID, &s_TouchRef[i], "SceTouch", TAI_ANY_LIBRARY, s_Nids[i], s_Fns[i] );
+		char note[80];
+		snprintf( note, sizeof( note ), "vdb: touch hook %d: 0x%08x\n", i, (unsigned)s_TouchHook[i] );
+		FileNote( note );
+	}
+}
+
+static void RemoveTouchHooks( void )
+{
+	for ( int i = 0; i < 4; i++ )
+		if ( s_TouchHook[i] >= 0 )
+			taiHookReleaseForKernel( s_TouchHook[i], s_TouchRef[i] );
+}
+
 static void ApplyInput( int bRelease )
 {
 	if ( bRelease )
@@ -686,6 +782,21 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 		break;
 	case VDB_CMD_SCREEN:
 		CmdScreen();
+		break;
+	case VDB_CMD_TOUCH:
+		if ( nPayload < sizeof( VdbTouch_t ) || s_TouchHook[0] < 0 )
+		{
+			SendReply( VDB_CMD_TOUCH, nPayload < sizeof( VdbTouch_t ) ? -2 : -6, 0 );	// -6: hooks not installed
+			break;
+		}
+		memcpy( &s_Touch, pPayload, sizeof( s_Touch ) );
+		if ( s_Touch.ms > 10000 )
+			s_Touch.ms = 10000;
+		if ( s_Touch.ms < 16 )
+			s_Touch.ms = 16;
+		s_nTouchStart = ksceKernelGetSystemTimeWide();
+		s_nTouchUntil = s_nTouchStart + (unsigned long long)s_Touch.ms * 1000;
+		SendReply( VDB_CMD_TOUCH, 0, 0 );
 		break;
 	case VDB_CMD_INPUT:
 		if ( nPayload < sizeof( VdbInput_t ) )
@@ -1096,6 +1207,7 @@ int module_start( SceSize argc, const void *args )
 		return SCE_KERNEL_START_FAILED;
 	}
 	s_bRegistered = 1;
+	InstallTouchHooks();
 	// decide the auto start before the thread runs (it read the flag
 	// before module_start set it: the takeover never happened)
 	{
@@ -1129,6 +1241,7 @@ int module_start( SceSize argc, const void *args )
 
 int module_stop( SceSize argc, const void *args )
 {
+	RemoveTouchHooks();
 	if ( s_bActive )
 		vdb_usb_stop();
 	if ( s_Evf >= 0 )

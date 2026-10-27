@@ -18,9 +18,9 @@ A taiHEN **kernel plugin** (`vdb.skprx`) that turns the PS Vita's USB port into 
 - **logs stream live over USB** while the game runs: the plugin keeps a 64 KB kernel log ring that any app can write to with one syscall (`vdb_write`); the host tails it. A game that mirrors its debug log into it has its loads, frame statistics, slow reads and crashes arrive on the computer as they happen, no card round trips;
 - **files move over the same cable** while the game runs: `vdb.py ls / stat / get / put / mkdir / rm / rmdir / mv` on any path the kernel can see (`ux0:`, `ur0:`, `uma0:`, `imc0:`, `vs0:`, `os0:` and the rest; the system partitions are yours to break). The commands go on a second bulk pipe, the replies and file data come back on a third, so no app on the Vita is involved and no USB mode switch is needed;
 - **the Vita reboots or powers off from the computer**: `vdb.py reboot` (cold; `reboot soft`, `poweroff`, `suspend` too). With `put` over `ux0:vdbplugin/vdb.skprx` the plugin replaces itself and reboots into the new build without a hand on the Vita;
-- **apps start and stop from the computer**: `vdb.py launch ABCD12345` (an installed title id, or a path to an eboot.bin, extra words become the app's arguments), `vdb.py kill` (the process that owns the screen; the shell is refused). Together with `put` into `ux0:app/<title>/` this replaces the VPK round trip for a game under development;
+- **apps start and stop from the computer**: `vdb.py launch ABCD12345` (an installed title id, or a `psgm:` uri) and `vdb.py kill` (the running app; `kill <pid>` for a specific process, the shell is refused). These go through a small user-side companion inside SceShell, `vdb_shell.suprx`, which calls the shell's own launch and close functions: launching from the kernel plugin itself takes the system down. Together with `put` into `ux0:app/<title>/` this replaces the VPK round trip for a game under development;
 - **the screen comes over the cable**: `vdb.py screen shot.png` copies the framebuffer of the process on screen out of its memory (960x544, about 0.3 s) and writes a PNG;
-- **buttons and sticks can be injected**: `vdb.py input cross --hold 200`, `vdb.py input --lx 255 --hold 1000` through the kernel's own controller emulation, no hooks;
+- **buttons, sticks and touch can be injected**: `vdb.py input cross --hold 200`, `vdb.py input --lx 255 --hold 1000` through the kernel's own controller emulation; `vdb.py touch X Y`, `vdb.py swipe X0 Y0 X1 Y1 --ms 400` through taiHEN hooks on the kernel touch readers (ds4vita's method), and `vdb.py unlock` peels the lock screen that every reboot leaves behind;
 - **the Vita stays awake** while the bridge is up (a power tick every 5 s): a self-locked Vita went unreachable over USB mid-session more than once;
 - **hotkeys** work without any app: `L + R + Start + Select` toggles the bridge (take the USB port / give it back to the system), `L + R + Start + Up` writes a status line to `ux0:vdbplugin/boot.txt`.
 
@@ -30,7 +30,7 @@ The roadmap, in the order each piece removes a manual step from a hardware debug
 
 ## Protocol
 
-Little-endian frames. Host to Vita (EP2 OUT, one USB transfer each, at most the plugin's receive buffer, 64 KB; the host reads the size from the `rx` field of the status reply before sending anything): `magic "VDB1", cmd, len, arg` (4 x u32) followed by the payload; paths are NUL-terminated, `rename` carries two. Vita to host (EP3 IN): `magic "VDBR", cmd, status (i32, SCE error when negative), len` followed by the payload. `get` answers with the 8-byte size, then 32 KB data frames, then an empty frame; `list` streams text lines (`d|f size yyyy-mm-dd hh:mm:ss name`) and ends with an empty frame whose status is the entry count; `put` is open, data frames (no replies, USB flow control does the pacing), close (status plus bytes written); `power` (cmd 13, arg 0 cold reboot, 1 soft reboot, 2 power off, 3 suspend) replies first and acts 300 ms later. `launch` (14, payload path and NUL-separated arguments, reply the pid), `kill` (15, arg pid or 0 for the screen owner), `screen` (16, reply a 24-byte header: width, height, pitch, pixel format, pid, bytes, then the raw rows in 32 KB frames, then an empty frame), `input` (17, payload buttons u32, four stick bytes, hold ms). One frame is in flight at a time on the Vita side, so a transfer needs no buffering beyond one chunk; the kernel side is about 170 KB of static memory in all. Measured on a Slim with an SD2Vita card: pull 8 MB/s, push 2.4 MB/s (a 21 MB file in 9 s).
+Little-endian frames. Host to Vita (EP2 OUT, one USB transfer each, at most the plugin's receive buffer, 64 KB; the host reads the size from the `rx` field of the status reply before sending anything): `magic "VDB1", cmd, len, arg` (4 x u32) followed by the payload; paths are NUL-terminated, `rename` carries two. Vita to host (EP3 IN): `magic "VDBR", cmd, status (i32, SCE error when negative), len` followed by the payload. `get` answers with the 8-byte size, then 32 KB data frames, then an empty frame; `list` streams text lines (`d|f size yyyy-mm-dd hh:mm:ss name`) and ends with an empty frame whose status is the entry count; `put` is open, data frames (no replies, USB flow control does the pacing), close (status plus bytes written); `power` (cmd 13, arg 0 cold reboot, 1 soft reboot, 2 power off, 3 suspend) replies first and acts 300 ms later. `launch` (14, payload path and NUL-separated arguments, reply the pid), `kill` (15, arg pid or 0 for the screen owner), `screen` (16, reply a 24-byte header: width, height, pitch, pixel format, pid, bytes, then the raw rows in 32 KB frames, then an empty frame), `input` (17, payload buttons u32, four stick bytes, hold ms), `touch` (18, payload x0 y0 x1 y1 as u16 screen pixels, ms u32: one finger moving linearly). The companion syscalls are `vdb_shell_poll` and `vdb_shell_result` (library VdbForUser). One frame is in flight at a time on the Vita side, so a transfer needs no buffering beyond one chunk; the kernel side is about 170 KB of static memory in all. Measured on a Slim with an SD2Vita card: pull 8 MB/s, push 2.4 MB/s (a 21 MB file in 9 s).
 
 ## Why
 
@@ -39,7 +39,7 @@ Developing on real hardware with only a memory card for feedback means: play, qu
 ## Install (firmware 3.65, HENkaku/Enso, taiHEN)
 
 1. Copy `dist/vdbplugin/` to `ux0:vdbplugin/` (it holds `vdb.skprx`, an empty `usb_on` flag and a README).
-2. Add `ux0:vdbplugin/vdb.skprx` under `*KERNEL` in `ur0:tai/config.txt` (or `ux0:tai/config.txt` if that is what your setup uses). On an SD2Vita setup put it after `storagemgr.skprx`.
+2. Add `ux0:vdbplugin/vdb.skprx` under `*KERNEL` in `ur0:tai/config.txt` (or `ux0:tai/config.txt` if that is what your setup uses). On an SD2Vita setup put it after `storagemgr.skprx`. For `launch` and `kill`, also add `ux0:vdbplugin/vdb_shell.suprx` under `*main`, after `henkaku.suprx`.
 3. Reboot. About 25 s after boot, once the shell's own USB driver is up, the plugin takes the USB port.
 4. On the computer (needs libusb and pyusb): `python3 host/vdb.py logs`, then `ping`, `status`, `ls ux0:` or `get ux0:data/some.log` from another terminal.
 
@@ -51,7 +51,7 @@ Link `user/stubs/libVDB_365_stub_weak.a`, include `user/vdb_user.h`, check that 
 
 ## Build
 
-VitaSDK: `make` in `skprx/` builds `vdb.skprx`; `vita-libs-gen user/vdb_nids.yml user/stubs && make -C user/stubs` rebuilds the user stub library.
+VitaSDK: `make` in `skprx/` builds `vdb.skprx`, `make` in `shell/` builds `vdb_shell.suprx`; `vita-libs-gen user/vdb_nids.yml user/stubs && make -C user/stubs` rebuilds the user stub library.
 
 ## Lessons the hard way
 

@@ -16,6 +16,9 @@
   vdb.py launch ABCD12345          start an installed app through the shell (needs vdb_shell.suprx)
   vdb.py kill [pid]                kill a process (default: the one that owns the screen; never the shell)
   vdb.py screen [out.png]          grab the screen (default: screen-<time>.png)
+  vdb.py touch X Y [--hold 100]    a finger on the front panel (screen pixels, 960x544)
+  vdb.py swipe X0 Y0 X1 Y1 [--ms 400]
+  vdb.py unlock                    peel the lock screen (a swipe from the top right corner)
   vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
                                    buttons: up down left right cross circle square triangle
                                    l r start select ps; sticks: --lx 255 --ly 0 --rx 128 --ry 128
@@ -46,7 +49,7 @@ RSP = struct.Struct("<IIiI")
 
 (CMD_PING, CMD_STATUS, CMD_LIST, CMD_STAT, CMD_GET, CMD_PUT_OPEN, CMD_PUT_DATA,
  CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME, CMD_POWER,
- CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT) = range(1, 18)
+ CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT, CMD_TOUCH) = range(1, 19)
 BUTTONS = {"select": 0x1, "l3": 0x2, "r3": 0x4, "start": 0x8, "up": 0x10, "right": 0x20, "down": 0x40,
            "left": 0x80, "l": 0x100, "r": 0x200, "l1": 0x400, "r1": 0x800, "triangle": 0x1000,
            "circle": 0x2000, "cross": 0x4000, "square": 0x8000, "ps": 0x10000}
@@ -280,6 +283,24 @@ def cmd_input(b, args):
     print(f"input: buttons 0x{buttons:x}, sticks {sticks}, held {hold} ms")
 
 
+def cmd_touch(b, x0, y0, x1, y1, ms, what):
+    payload = struct.pack("<4HI", x0, y0, x1, y1, ms)
+    status, _ = b.simple(CMD_TOUCH, payload)
+    if status == -6:
+        sys.exit("touch: the plugin's touch hooks are not installed (taiHEN missing?)")
+    check(status, "touch")
+    print(f"{what}: ({x0},{y0}) -> ({x1},{y1}) over {ms} ms")
+
+
+def opt_int(args, name, default):
+    if name in args:
+        i = args.index(name)
+        v = int(args[i + 1])
+        del args[i:i + 2]
+        return v
+    return default
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -336,6 +357,15 @@ def main():
         cmd_screen(b, *rest)
     elif cmd == "input" and rest:
         cmd_input(b, rest)
+    elif cmd == "touch" and len(rest) >= 2:
+        hold = opt_int(rest, "--hold", 100)
+        x, y = int(rest[0]), int(rest[1])
+        cmd_touch(b, x, y, x, y, hold, "touch")
+    elif cmd == "swipe" and len(rest) >= 4:
+        ms = opt_int(rest, "--ms", 400)
+        cmd_touch(b, *(int(v) for v in rest[:4]), ms, "swipe")
+    elif cmd == "unlock":
+        cmd_touch(b, 930, 60, 200, 500, 600, "unlock swipe")
     elif cmd in ("reboot", "poweroff", "suspend") and len(rest) <= 1:
         action = "soft" if (cmd == "reboot" and rest == ["soft"]) else cmd
         if action not in POWER_ACTIONS:

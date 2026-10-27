@@ -2,7 +2,7 @@ TARGET	= vdb
 OBJS	= main.o
 LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
-	-lSceIofilemgrForDriver_stub -lSceSysclibForDriver_stub -lSceCtrlForDriver_stub -lScePowerForDriver_stub -lSceKernelSuspendForDriver_stub -lSceAppMgrForDriver_stub -lSceDisplayForDriver_stub -lSceSysrootForDriver_stub
+	-lSceIofilemgrForDriver_stub -lSceSysclibForDriver_stub -lSceCtrlForDriver_stub -lScePowerForDriver_stub -lSceKernelSuspendForDriver_stub -lSceAppMgrForDriver_stub -lSceDisplayForDriver_stub -lSceSysrootForDriver_stub -ltaihenForKernel_stub
 
 PREFIX	= arm-vita-eabi
 CC	= $(PREFIX)-gcc
