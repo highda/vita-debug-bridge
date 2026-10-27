@@ -369,6 +369,16 @@ int vdb_usb_stop( void )
 	return 0;
 }
 
+// A line in ux0:vdbplugin/boot.txt: the only trace when USB doesn't come up
+static void FileNote( const char *pszText )
+{
+	SceUID fd = ksceIoOpen( "ux0:vdbplugin/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777 );
+	if ( fd < 0 )
+		return;
+	ksceIoWrite( fd, pszText, strlen( pszText ) );
+	ksceIoClose( fd );
+}
+
 //-----------------------------------------------------------------------------
 // Module entry
 //-----------------------------------------------------------------------------
@@ -401,10 +411,14 @@ int module_start( SceSize argc, const void *args )
 		ksceIoClose( fd );
 		int ret = vdb_usb_start();
 		Log( "vdb: usb start at boot: 0x%08x", ret );
+		char note[96];
+		snprintf( note, sizeof( note ), "vdb " VDB_VERSION ": loaded, usb start 0x%08x (uptime %u s)\n", ret, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+		FileNote( note );
 	}
 	else
 	{
 		Log( "vdb: usb idle (no " VDB_FLAG_FILE ")" );
+		FileNote( "vdb " VDB_VERSION ": loaded, usb idle (no usb_on flag)\n" );
 	}
 	return SCE_KERNEL_START_SUCCESS;
 }
