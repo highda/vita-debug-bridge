@@ -305,9 +305,13 @@ static int UsbThread( SceSize args, void *argp )
 			if ( ksceCtrlPeekBufferPositive( 0, &pad, 1 ) > 0 )
 			{
 				const unsigned nCombo = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_START;
-				unsigned nNow = pad.buttons, nPressed = nNow & ~nPrevButtons;
+				const unsigned nToggle = nCombo | SCE_CTRL_SELECT, nStatus = nCombo | SCE_CTRL_UP;
+				unsigned nNow = pad.buttons;
+				// fires once when all keys of a combo are held, in any order
+				int bToggle = ( nNow & nToggle ) == nToggle && ( nPrevButtons & nToggle ) != nToggle;
+				int bStatus = ( nNow & nStatus ) == nStatus && ( nPrevButtons & nStatus ) != nStatus;
 				nPrevButtons = nNow;
-				if ( ( nNow & nCombo ) == nCombo && ( nPressed & SCE_CTRL_SELECT ) )
+				if ( bToggle )
 				{
 					int r = s_bActive ? vdb_usb_stop() : vdb_usb_start();
 					char note[96];
@@ -316,7 +320,7 @@ static int UsbThread( SceSize args, void *argp )
 					FileNote( note );
 					Log( "%s", note );
 				}
-				else if ( ( nNow & nCombo ) == nCombo && ( nPressed & SCE_CTRL_UP ) )
+				else if ( bStatus )
 				{
 					char note[128];
 					snprintf( note, sizeof( note ), "vdb: status: usb %s, host %s, ring %u used of %u, dropped %u, uptime %u s\n",
@@ -470,6 +474,16 @@ int module_start( SceSize argc, const void *args )
 		return SCE_KERNEL_START_FAILED;
 	}
 	s_bRegistered = 1;
+	// decide the auto start before the thread runs (it read the flag
+	// before module_start set it: the takeover never happened)
+	{
+		SceUID fdFlag = ksceIoOpen( VDB_FLAG_FILE, SCE_O_RDONLY, 0 );
+		if ( fdFlag >= 0 )
+		{
+			ksceIoClose( fdFlag );
+			s_bAutoStart = 1;
+		}
+	}
 	int st = ksceKernelStartThread( s_Thread, 0, NULL );
 	{
 		char note[96];
@@ -478,11 +492,8 @@ int module_start( SceSize argc, const void *args )
 	}
 
 	// the flag file decides whether we take the USB port at boot
-	SceUID fd = ksceIoOpen( VDB_FLAG_FILE, SCE_O_RDONLY, 0 );
-	if ( fd >= 0 )
+	if ( s_bAutoStart )
 	{
-		ksceIoClose( fd );
-		s_bAutoStart = 1;
 		Log( "vdb: usb start scheduled for after boot" );
 		FileNote( "vdb " VDB_VERSION ": loaded, usb start scheduled after the shell is up\n" );
 	}
