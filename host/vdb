@@ -1,0 +1,5 @@
+#!/bin/sh
+# vdb: thin launcher for vdb.py. Put this directory on PATH, or symlink this
+# file into one (ln -s "$PWD/host/vdb" /usr/local/bin/vdb). Set VDB_PYTHON to
+# an interpreter that has pyusb if the default python3 does not.
+exec "${VDB_PYTHON:-python3}" "$(dirname "$0")/vdb.py" "$@"

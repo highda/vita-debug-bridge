@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """vdb: host side of the Vita debug bridge.
 
-  vdb.py logs                      tail the Vita's log ring over USB (interface 0)
+  vdb.py logs [--ts] [--file f]    tail the Vita's log ring over USB (interface 0); --ts stamps
+                                   each line with the Mac's time, --file also appends to a file
+  vdb.py run ABCD12345 [game.vpk]  install (when a VPK is given), launch, then tail the logs
   vdb.py ping                      round trip over the command pipe
   vdb.py status                    ring/uptime status
   vdb.py ls  ux0:data              list a directory (any device: ux0:, ur0:, uma0:, vs0:, os0: ...)
@@ -131,12 +133,21 @@ def check(status, what):
         sys.exit(f"{what}: error 0x{status & 0xFFFFFFFF:08x}")
 
 
-def logs():
+def logs(stamp=False, path=None):
     """Tail the ring; when the Vita leaves the bus (reboot, sleep, cable) wait
     for it to come back and attach again, so one recorder covers a whole
     session of reboots."""
     dev = None
     buf = b""
+    out = open(path, "a") if path else None
+
+    def emit(line):
+        if stamp:
+            line = time.strftime("%H:%M:%S ") + line
+        print(line, flush=True)
+        if out:
+            out.write(line + "\n")
+            out.flush()
     while True:
         if dev is None:
             while usb.core.find(idVendor=VID, idProduct=PID) is None:
@@ -164,7 +175,7 @@ def logs():
         buf += bytes(data)
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            print(line.decode("utf-8", "replace"), flush=True)
+            emit(line.decode("utf-8", "replace"))
 
 
 def cmd_ls(b, path):
@@ -350,9 +361,22 @@ def main():
         return 1
     cmd, rest = args[0], args[1:]
     if cmd == "logs":
-        logs()
+        path = rest[rest.index("--file") + 1] if "--file" in rest else None
+        logs(stamp="--ts" in rest, path=path)
         return 0
     b = Bridge()
+    if cmd == "run" and 1 <= len(rest) <= 2:
+        title = rest[0]
+        if len(rest) == 2:
+            cmd_install(b, rest[1], title)
+        status, _ = b.simple(CMD_LAUNCH, path_arg(title))
+        if status == -5:
+            sys.exit("run: the shell companion is not running (vdb_shell.suprx under *main in config.txt)")
+        check(status, f"launch {title}")
+        print(f"{title} launched; tailing the log (ctrl-c to stop)", file=sys.stderr)
+        usb.util.dispose_resources(b.dev)
+        logs(stamp=True)
+        return 0
     if cmd == "ping":
         t0 = time.time()
         status, _ = b.simple(CMD_PING)

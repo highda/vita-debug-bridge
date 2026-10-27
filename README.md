@@ -30,6 +30,31 @@ The log pipe and the command pipe are on separate USB interfaces, so a log tail 
 
 The roadmap, in the order each piece removes a manual step from a hardware debugging loop: VPK install and app launch through a user-side companion, controller and touch injection, screen capture (hardware JPEG, as vita-udcd-uvc does), and an on-screen status display.
 
+## Quick start
+
+```
+python3 host/vdb.py logs --ts                 # live log, one line per event, timestamped
+python3 host/vdb.py run ABCD12345 game.vpk    # write the build over the installed app, start it, tail the log
+python3 host/vdb.py screen                    # screen-HHMMSS.png
+python3 host/vdb.py input cross               # press X
+python3 host/vdb.py kill                      # close the app, back to the home screen
+python3 host/vdb.py reboot                    # cold reboot; `unlock` peels the lock screen afterwards
+```
+
+`host/vdb` is a one-line launcher for the same script (symlink it into your PATH; `VDB_PYTHON` picks the interpreter that has pyusb).
+
+| Command | What it does |
+|---|---|
+| `logs [--ts] [--file f]` | tail the log ring; reattaches by itself after a reboot or a cable pull |
+| `ping`, `status` | round trip; version, ring use, uptime, frame size |
+| `ls`, `stat`, `get`, `put`, `mkdir`, `rm`, `rmdir`, `mv` | files on any device the kernel sees (`ux0:`, `ur0:`, `uma0:`, `vs0:`, ...) |
+| `install game.vpk TITLE` | a VPK's files written over `ux0:app/TITLE/` (the title must exist once) |
+| `launch TITLE`, `kill [pid]` | start an app, close the running app (through the shell companion) |
+| `run TITLE [game.vpk]` | install, launch, tail |
+| `screen [out.png]` | the framebuffer of the process on screen, as a PNG |
+| `input ...`, `touch X Y`, `swipe X0 Y0 X1 Y1`, `unlock` | buttons, sticks, a finger, the lock screen peel |
+| `reboot [soft]`, `poweroff`, `suspend` | power |
+
 ## Protocol
 
 Little-endian frames. Host to Vita (EP2 OUT, one USB transfer each, at most the plugin's receive buffer, 64 KB; the host reads the size from the `rx` field of the status reply before sending anything): `magic "VDB1", cmd, len, arg` (4 x u32) followed by the payload; paths are NUL-terminated, `rename` carries two. Vita to host (EP3 IN): `magic "VDBR", cmd, status (i32, SCE error when negative), len` followed by the payload. `get` answers with the 8-byte size, then 32 KB data frames, then an empty frame; `list` streams text lines (`d|f size yyyy-mm-dd hh:mm:ss name`) and ends with an empty frame whose status is the entry count; `put` is open, data frames (no replies, USB flow control does the pacing), close (status plus bytes written); `power` (cmd 13, arg 0 cold reboot, 1 soft reboot, 2 power off, 3 suspend) replies first and acts 300 ms later. `launch` (14, payload path and NUL-separated arguments, reply the pid), `kill` (15, arg pid or 0 for the screen owner), `screen` (16, reply a 24-byte header: width, height, pitch, pixel format, pid, bytes, then the raw rows in 32 KB frames, then an empty frame), `input` (17, payload buttons u32, four stick bytes, hold ms), `touch` (18, payload x0 y0 x1 y1 as u16 screen pixels, ms u32: one finger moving linearly). The companion syscalls are `vdb_shell_poll` and `vdb_shell_result` (library VdbForUser). One frame is in flight at a time on the Vita side, so a transfer needs no buffering beyond one chunk; the kernel side is about 170 KB of static memory in all. Measured on a Slim with an SD2Vita card: pull 8 MB/s, push 6.0 MB/s to the card with 256 KB frames (a 21 MB file in 3.5 s; 8.4 MB/s to ur0: the card write is the limit, and bigger writes help it). The two receive buffers live in a physically contiguous uncached kernel block, which the USB controller needs; a buffer in the module's own .bss is not reliably reachable.
