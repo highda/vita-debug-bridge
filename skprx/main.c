@@ -99,6 +99,16 @@ static unsigned RingTake( unsigned char *pDest, unsigned nMax )
 	return n;
 }
 
+// A line in ux0:vdbplugin/boot.txt: the only trace when USB doesn't come up
+static void FileNote( const char *pszText )
+{
+	SceUID fd = ksceIoOpen( "ux0:vdbplugin/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777 );
+	if ( fd < 0 )
+		return;
+	ksceIoWrite( fd, pszText, strlen( pszText ) );
+	ksceIoClose( fd );
+}
+
 //-----------------------------------------------------------------------------
 // USB requests
 //-----------------------------------------------------------------------------
@@ -237,11 +247,34 @@ static SceUdcdDriver s_Driver = {
 //-----------------------------------------------------------------------------
 // USB thread: streams the ring while a host is attached, heartbeat every 5 s
 //-----------------------------------------------------------------------------
+static int s_bAutoStart;	// ux0:vdbplugin/usb_on existed at boot
+int vdb_usb_start( void );
+
 static int UsbThread( SceSize args, void *argp )
 {
 	int bConnected = 0, bSending = 0;
 	unsigned nBeats = 0;
 	SceUInt nTimeout = 5 * 1000 * 1000;
+
+	// Taking the USB port during boot (at 13 s uptime) killed the boot
+	// three times: SceShell brings up its own USB services (MTP) after
+	// that and the two collided. As udcd_uvc does, wait until the system's
+	// MTP driver is activated (the shell is up), then take over
+	if ( s_bAutoStart )
+	{
+		SceUdcdWaitParam wp;
+		memset( &wp, 0, sizeof( wp ) );
+		wp.status = SCE_UDCD_STATUS_ACTIVATED;
+		wp.driverName = "USB_MTP_Driver";
+		int w = ksceUdcdWaitState( &wp, 90 * 1000 * 1000 );
+		ksceKernelDelayThread( 2 * 1000 * 1000 );
+		int ret = vdb_usb_start();
+		Log( "vdb: usb start after boot: 0x%08x (mtp wait 0x%08x)", ret, w );
+		char note[96];
+		snprintf( note, sizeof( note ), "vdb " VDB_VERSION ": usb start after boot 0x%08x (mtp wait 0x%08x, uptime %u s)\n", ret, w,
+			(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+		FileNote( note );
+	}
 	for ( ;; )
 	{
 		unsigned int bits = 0;
@@ -369,16 +402,6 @@ int vdb_usb_stop( void )
 	return 0;
 }
 
-// A line in ux0:vdbplugin/boot.txt: the only trace when USB doesn't come up
-static void FileNote( const char *pszText )
-{
-	SceUID fd = ksceIoOpen( "ux0:vdbplugin/boot.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777 );
-	if ( fd < 0 )
-		return;
-	ksceIoWrite( fd, pszText, strlen( pszText ) );
-	ksceIoClose( fd );
-}
-
 //-----------------------------------------------------------------------------
 // Module entry
 //-----------------------------------------------------------------------------
@@ -409,11 +432,9 @@ int module_start( SceSize argc, const void *args )
 	if ( fd >= 0 )
 	{
 		ksceIoClose( fd );
-		int ret = vdb_usb_start();
-		Log( "vdb: usb start at boot: 0x%08x", ret );
-		char note[96];
-		snprintf( note, sizeof( note ), "vdb " VDB_VERSION ": loaded, usb start 0x%08x (uptime %u s)\n", ret, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
-		FileNote( note );
+		s_bAutoStart = 1;
+		Log( "vdb: usb start scheduled for after boot" );
+		FileNote( "vdb " VDB_VERSION ": loaded, usb start scheduled after the shell is up\n" );
 	}
 	else
 	{
