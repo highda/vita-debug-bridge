@@ -27,12 +27,16 @@
 #include <psp2kern/ctrl.h>
 #include <psp2kern/power.h>
 #include <psp2kern/kernel/suspend.h>
+#include <psp2kern/kernel/sysroot.h>
+#include <psp2kern/kernel/sysmem/data_transfers.h>
+#include <psp2kern/appmgr.h>
+#include <psp2kern/display.h>
 #include <stdarg.h>
 #include "usb_descriptors.h"
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.2.3"
+#define VDB_VERSION		"0.3.1"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -78,6 +82,10 @@ enum
 	VDB_CMD_REMOVE		= 10,
 	VDB_CMD_RMDIR		= 11,
 	VDB_CMD_RENAME		= 12,	// payload: "old\0new\0"
+	VDB_CMD_LAUNCH		= 14,	// payload: "path\0args\0..."; reply payload: 4-byte pid
+	VDB_CMD_KILL		= 15,	// arg: pid (0 = the process that owns the screen); reply payload: 4-byte pid
+	VDB_CMD_SCREEN		= 16,	// reply: VdbScreenHdr_t, then the raw framebuffer in frames, then an empty frame
+	VDB_CMD_INPUT		= 17,	// payload: VdbInput_t; held for hold_ms, then released
 	VDB_CMD_POWER		= 13,	// arg: 0 cold reboot, 1 soft reboot, 2 power off, 3 suspend; replies, then acts 300 ms later
 };
 
@@ -92,6 +100,24 @@ typedef struct
 	int status;
 	unsigned len;
 } VdbRspHdr_t;
+
+typedef struct
+{
+	unsigned width, height, pitch, pixelformat, pid, bytes;
+} VdbScreenHdr_t;
+
+typedef struct
+{
+	unsigned buttons;			// SCE_CTRL_* bits
+	unsigned char lx, ly, rx, ry;	// sticks, 0x80 = centre
+	unsigned hold_ms;			// how long the state is held before the release
+} VdbInput_t;
+
+// Injected pad state, re-applied from the USB thread every 200 ms until the
+// deadline (the emulation lasts a given number of samples, so a long hold
+// needs refreshing), then released once
+static VdbInput_t s_Input;
+static unsigned long long s_nInputUntil;	// system time, 0 = nothing held
 
 static char s_Ring[RING_SIZE];
 static unsigned s_nRingWrite, s_nRingRead;	// monotonic byte counters; valid = write - read
@@ -419,6 +445,127 @@ static void CmdPutClose( void )
 	SendReply( VDB_CMD_PUT_CLOSE, nStatus, 8 );
 }
 
+static void ApplyInput( int bRelease )
+{
+	if ( bRelease )
+	{
+		ksceCtrlSetButtonEmulation( 0, 0, 0, 0, 1 );
+		ksceCtrlSetAnalogEmulation( 0, 0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 1 );
+		return;
+	}
+	// 64 samples outlast the 200 ms refresh at any sampling rate
+	ksceCtrlSetButtonEmulation( 0, 0, s_Input.buttons, s_Input.buttons, 64 );
+	ksceCtrlSetAnalogEmulation( 0, 0, s_Input.lx, s_Input.ly, s_Input.rx, s_Input.ry, s_Input.lx, s_Input.ly, s_Input.rx, s_Input.ry, 64 );
+}
+
+// Called from the thread loop every 200 ms
+static void InputTick( void )
+{
+	if ( !s_nInputUntil )
+		return;
+	if ( ksceKernelGetSystemTimeWide() >= s_nInputUntil )
+	{
+		s_nInputUntil = 0;
+		ApplyInput( 1 );
+	}
+	else
+		ApplyInput( 0 );
+}
+
+// The process whose framebuffer is on the screen (the foreground app, or the shell)
+static SceUID ScreenOwner( SceDisplayFrameBufInfo *pInfo )
+{
+	memset( pInfo, 0, sizeof( *pInfo ) );
+	pInfo->size = sizeof( *pInfo );
+	int head = ksceDisplayGetPrimaryHead();
+	int r = ksceDisplayGetProcFrameBufInternal( -1, head, 0, pInfo );
+	if ( r < 0 || pInfo->paddr == 0 )
+		r = ksceDisplayGetProcFrameBufInternal( -1, head, 1, pInfo );
+	if ( r < 0 )
+		return r;
+	return pInfo->pid;
+}
+
+// LAUNCH: as h-encore's payload does it, a zeroed 52-byte option block
+static void CmdLaunch( const char *pszPath, unsigned nPayload )
+{
+	unsigned nPathLen = strlen( pszPath );
+	const char *pszArgs = pszPath + nPathLen + 1;
+	unsigned nArgs = nPathLen + 1 < nPayload ? nPayload - nPathLen - 1 : 0;
+	int opt[52 / 4];
+	memset( opt, 0, sizeof( opt ) );
+	opt[0] = sizeof( opt );
+	int pid = ksceAppMgrLaunchAppByPath( pszPath, nArgs ? pszArgs : NULL, nArgs, 0, (const SceAppMgrLaunchParam *)opt, NULL );
+	Log( "vdb: launch %s: 0x%08x", pszPath, pid );
+	memcpy( ReplyPayload(), &pid, 4 );
+	SendReply( VDB_CMD_LAUNCH, pid < 0 ? pid : 0, 4 );
+}
+
+static void CmdKill( int pid )
+{
+	SceDisplayFrameBufInfo info;
+	if ( pid == 0 )
+		pid = ScreenOwner( &info );
+	SceUID shell = ksceKernelSysrootGetShellPid();
+	if ( pid <= 0 || pid == shell )
+	{
+		// never the shell: a dead SceShell means a reboot
+		memcpy( ReplyPayload(), &pid, 4 );
+		SendReply( VDB_CMD_KILL, pid <= 0 ? pid : -3, 4 );
+		return;
+	}
+	int r = ksceAppMgrKillProcess( pid );
+	Log( "vdb: kill pid 0x%08x: 0x%08x", pid, r );
+	memcpy( ReplyPayload(), &pid, 4 );
+	SendReply( VDB_CMD_KILL, r, 4 );
+}
+
+// SCREEN: header, then the framebuffer rows copied out of the owning process
+static void CmdScreen( void )
+{
+	SceDisplayFrameBufInfo info;
+	SceUID pid = ScreenOwner( &info );
+	if ( pid < 0 )
+	{
+		SendReply( VDB_CMD_SCREEN, pid, 0 );
+		return;
+	}
+	VdbScreenHdr_t hdr;
+	hdr.width = info.framebuf.width;
+	hdr.height = info.framebuf.height;
+	hdr.pitch = info.framebuf.pitch;
+	hdr.pixelformat = info.framebuf.pixelformat;
+	hdr.pid = pid;
+	hdr.bytes = hdr.pitch * hdr.height * 4;
+	if ( hdr.width == 0 || hdr.height == 0 || hdr.pitch < hdr.width || hdr.bytes > 8 * 1024 * 1024 )
+	{
+		SendReply( VDB_CMD_SCREEN, -4, 0 );
+		return;
+	}
+	memcpy( ReplyPayload(), &hdr, sizeof( hdr ) );
+	if ( SendReply( VDB_CMD_SCREEN, 0, sizeof( hdr ) ) < 0 )
+		return;
+	const unsigned char *pSrc = (const unsigned char *)info.framebuf.base;
+	unsigned nDone = 0;
+	int nErr = 0;
+	while ( nDone < hdr.bytes )
+	{
+		unsigned n = hdr.bytes - nDone;
+		if ( n > DATA_CHUNK )
+			n = DATA_CHUNK;
+		int r = ksceKernelCopyFromUserProc( pid, ReplyPayload(), pSrc + nDone, n );
+		if ( r < 0 )
+		{
+			nErr = r;
+			break;
+		}
+		if ( SendReply( VDB_CMD_SCREEN, 0, n ) < 0 )
+			return;
+		nDone += n;
+	}
+	SendReply( VDB_CMD_SCREEN, nErr, 0 );
+}
+
 // Commands from the host. Framed (VdbCmdHdr_t + payload), or the 0.1
 // single bytes 'P' ping and 'S' status, which only log
 static void HandleCommand( unsigned char *pCmd, int nLen )
@@ -500,6 +647,28 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 		SendReply( VDB_CMD_RENAME, ksceIoRename( pszPath, pszNew ), 0 );
 		break;
 	}
+	case VDB_CMD_LAUNCH:
+		CmdLaunch( pszPath, nPayload );
+		break;
+	case VDB_CMD_KILL:
+		CmdKill( (int)hdr.arg );
+		break;
+	case VDB_CMD_SCREEN:
+		CmdScreen();
+		break;
+	case VDB_CMD_INPUT:
+		if ( nPayload < sizeof( VdbInput_t ) )
+		{
+			SendReply( VDB_CMD_INPUT, -2, 0 );
+			break;
+		}
+		memcpy( &s_Input, pPayload, sizeof( s_Input ) );
+		if ( s_Input.hold_ms > 10000 )
+			s_Input.hold_ms = 10000;
+		s_nInputUntil = ksceKernelGetSystemTimeWide() + (unsigned long long)s_Input.hold_ms * 1000;
+		ApplyInput( 0 );
+		SendReply( VDB_CMD_INPUT, 0, 0 );
+		break;
 	case VDB_CMD_POWER:
 	{
 		// reply first (the host waits for it), then act once the reply is on
@@ -669,6 +838,29 @@ static int UsbThread( SceSize args, void *argp )
 				if ( s_bActive )
 					ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
 			}
+			InputTick();
+			// Starting an app makes the system re-activate its own USB
+			// device (0x4E4, Content Manager) and ours silently goes away:
+			// the first `launch` from the host left the Vita unreachable.
+			// Once a second, while we believe we own the port, check the
+			// system driver and take the port back if it came up
+			if ( s_bActive && nTicks % 5 == 0 )
+			{
+				int mtp = ksceUdcdGetDrvState( "USB_MTP_Driver" );
+				if ( mtp & SCE_UDCD_STATUS_ACTIVATED )
+				{
+					s_bActive = 0;
+					bConnected = 0;
+					bSending = 0;
+					PutAbort();
+					int r = vdb_usb_start();
+					Log( "vdb: the system took the USB port (mtp state 0x%x), retaken: 0x%08x", mtp, r );
+					char note[96];
+					snprintf( note, sizeof( note ), "vdb: port retaken after the system took it: 0x%08x (uptime %u s)\n", r,
+						(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+					FileNote( note );
+				}
+			}
 			SceCtrlData pad;
 			memset( &pad, 0, sizeof( pad ) );
 			if ( ksceCtrlPeekBufferPositive( 0, &pad, 1 ) > 0 )
@@ -714,6 +906,11 @@ static int UsbThread( SceSize args, void *argp )
 			bConnected = 0;
 			bSending = 0;
 			PutAbort();	// a half-written file stays, truncated; the host reports the failure
+			if ( s_nInputUntil )
+			{
+				s_nInputUntil = 0;
+				ApplyInput( 1 );
+			}
 		}
 		if ( bits & EVF_RECEIVED )
 		{

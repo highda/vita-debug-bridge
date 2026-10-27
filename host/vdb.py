@@ -13,6 +13,12 @@
   vdb.py rmdir ux0:data/dir
   vdb.py mv ux0:data/a ux0:data/b
   vdb.py reboot                    cold reboot (also: reboot soft, poweroff, suspend)
+  vdb.py launch ABCD12345 [args]   start an installed app (a title id, or a path to an eboot.bin)
+  vdb.py kill [pid]                kill a process (default: the one that owns the screen; never the shell)
+  vdb.py screen [out.png]          grab the screen (default: screen-<time>.png)
+  vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
+                                   buttons: up down left right cross circle square triangle
+                                   l r start select ps; sticks: --lx 255 --ly 0 --rx 128 --ry 128
 
 `logs` and the other commands use different USB interfaces, so a log tail can
 stay attached in one terminal while files move in another.
@@ -39,7 +45,11 @@ HDR = struct.Struct("<IIII")   # cmd: magic, cmd, len, arg; rsp: magic, cmd, sta
 RSP = struct.Struct("<IIiI")
 
 (CMD_PING, CMD_STATUS, CMD_LIST, CMD_STAT, CMD_GET, CMD_PUT_OPEN, CMD_PUT_DATA,
- CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME, CMD_POWER) = range(1, 14)
+ CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME, CMD_POWER,
+ CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT) = range(1, 18)
+BUTTONS = {"select": 0x1, "l3": 0x2, "r3": 0x4, "start": 0x8, "up": 0x10, "right": 0x20, "down": 0x40,
+           "left": 0x80, "l": 0x100, "r": 0x200, "l1": 0x400, "r1": 0x800, "triangle": 0x1000,
+           "circle": 0x2000, "cross": 0x4000, "square": 0x8000, "ps": 0x10000}
 POWER_ACTIONS = {"reboot": 0, "soft": 1, "poweroff": 2, "suspend": 3}
 
 RX_SIZE_OLD = 4096             # the command buffer of vdb 0.2 (no "rx" in its status line)
@@ -213,6 +223,63 @@ def cmd_put(b, src, dst):
         sys.exit(f"size mismatch: wrote {written}, expected {size}")
 
 
+def write_png(path, width, height, rows_rgb):
+    import zlib
+    raw = b"".join(b"\x00" + r for r in rows_rgb)
+
+    def chunk(tag, data):
+        c = tag + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def cmd_screen(b, out=None):
+    out = out or time.strftime("screen-%H%M%S.png")
+    b.send(CMD_SCREEN)
+    _, status, data = b.reply()
+    check(status, "screen")
+    width, height, pitch, fmt, pid, nbytes = struct.unpack("<6I", data[:24])
+    buf = bytearray()
+    while True:
+        _, status, data = b.reply(timeout=15000)
+        if not data:
+            check(status, "screen")
+            break
+        buf += data
+    if len(buf) != nbytes:
+        sys.exit(f"screen: got {len(buf)} of {nbytes} bytes")
+    # pixel format 0 is A8B8G8R8: bytes in memory are R, G, B, A
+    rows = []
+    for y in range(height):
+        row = buf[y * pitch * 4:(y * pitch + width) * 4]
+        rows.append(bytes(v for i, v in enumerate(row) if i % 4 != 3))
+    write_png(out, width, height, rows)
+    print(f"{out}: {width}x{height} (pitch {pitch}, format 0x{fmt:x}, pid 0x{pid:x})")
+
+
+def cmd_input(b, args):
+    buttons, hold = 0, 200
+    sticks = {"lx": 0x80, "ly": 0x80, "rx": 0x80, "ry": 0x80}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--hold":
+            hold = int(args[i + 1]); i += 2
+        elif a[2:] in sticks and a.startswith("--"):
+            sticks[a[2:]] = max(0, min(255, int(args[i + 1]))); i += 2
+        elif a in BUTTONS:
+            buttons |= BUTTONS[a]; i += 1
+        else:
+            sys.exit(f"input: unknown '{a}'")
+    payload = struct.pack("<I4BI", buttons, sticks["lx"], sticks["ly"], sticks["rx"], sticks["ry"], hold)
+    status, _ = b.simple(CMD_INPUT, payload)
+    check(status, "input")
+    print(f"input: buttons 0x{buttons:x}, sticks {sticks}, held {hold} ms")
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -248,6 +315,27 @@ def main():
         check(b.simple(CMD_RMDIR, path_arg(rest[0]))[0], f"rmdir {rest[0]}")
     elif cmd == "mv" and len(rest) == 2:
         check(b.simple(CMD_RENAME, path_arg(rest[0]) + path_arg(rest[1]))[0], f"mv {rest[0]}")
+    elif cmd == "launch" and rest:
+        target = rest[0]
+        path = target if ":" in target else f"ux0:app/{target}/eboot.bin"
+        payload = path_arg(path) + b"".join(path_arg(a) for a in rest[1:])
+        status, data = b.simple(CMD_LAUNCH, payload)
+        (pid,) = struct.unpack("<i", data[:4]) if len(data) >= 4 else (0,)
+        check(status, f"launch {path}")
+        print(f"launched {path}: pid 0x{pid:x}")
+    elif cmd == "kill" and len(rest) <= 1:
+        pid = int(rest[0], 0) if rest else 0
+        b.send(CMD_KILL, arg=pid & 0xFFFFFFFF)
+        _, status, data = b.reply()
+        (pid,) = struct.unpack("<i", data[:4]) if len(data) >= 4 else (0,)
+        if status == -3:
+            sys.exit(f"kill: pid 0x{pid:x} is the shell, refused")
+        check(status, "kill")
+        print(f"killed pid 0x{pid:x}")
+    elif cmd == "screen" and len(rest) <= 1:
+        cmd_screen(b, *rest)
+    elif cmd == "input" and rest:
+        cmd_input(b, rest)
     elif cmd in ("reboot", "poweroff", "suspend") and len(rest) <= 1:
         action = "soft" if (cmd == "reboot" and rest == ["soft"]) else cmd
         if action not in POWER_ACTIONS:
