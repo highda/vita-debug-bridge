@@ -470,7 +470,12 @@ int module_start( SceSize argc, const void *args )
 		return SCE_KERNEL_START_FAILED;
 	}
 	s_bRegistered = 1;
-	ksceKernelStartThread( s_Thread, 0, NULL );
+	int st = ksceKernelStartThread( s_Thread, 0, NULL );
+	{
+		char note[96];
+		snprintf( note, sizeof( note ), "vdb: thread 0x%08x start 0x%08x\n", (unsigned)s_Thread, st );
+		FileNote( note );
+	}
 
 	// the flag file decides whether we take the USB port at boot
 	SceUID fd = ksceIoOpen( VDB_FLAG_FILE, SCE_O_RDONLY, 0 );
