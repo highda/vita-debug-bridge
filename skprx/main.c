@@ -38,12 +38,12 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.3.7"
+#define VDB_VERSION		"0.3.8"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
 #define CHUNK_SIZE		4096
-#define RX_SIZE			( 64 * 1024 )	// one command frame: header + payload; 64 KB so a PUT costs one transfer and one card write per 64 KB (4 KB frames: 0.7 MB/s)
+#define RX_SIZE			( 256 * 1024 )	// one command frame: header + payload. A PUT costs one transfer and one card write per frame: 4 KB frames 0.7 MB/s, 64 KB 2.4, 256 KB 6.0 (SD2Vita)
 #define DATA_CHUNK		( 32 * 1024 )	// reply payload per frame on EP3
 
 enum
