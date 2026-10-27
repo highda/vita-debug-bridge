@@ -1,24 +1,30 @@
-// vdb: USB descriptors. A vendor-specific device (class 0xFF) with one
-// interface and two bulk endpoints: EP1 IN streams the log ring to the
-// host, EP2 OUT carries commands from the host. Sony's vendor ID is filled
-// in by ksceUdcdActivate; the product ID is VDB_USB_PID (main.c).
+// vdb: USB descriptors. A vendor-specific device (class 0xFF) with two
+// interfaces and three bulk endpoints:
+//   interface 0: EP1 IN   the log ring, streamed to the host (vdb.py logs)
+//   interface 1: EP2 OUT  framed commands from the host
+//                EP3 IN   command replies and file data
+// Two interfaces so that a log tail and a file transfer can run from two
+// host processes at once (libusb claims are per interface). Sony's vendor
+// ID is filled in by ksceUdcdActivate; the product ID is VDB_USB_PID.
 #ifndef VDB_USB_DESCRIPTORS_H
 #define VDB_USB_DESCRIPTORS_H
 
 #include <psp2kern/udcd.h>
 
-#define VDB_EP_IN	1
-#define VDB_EP_OUT	2
+#define VDB_EP_IN		1
+#define VDB_EP_OUT		2
+#define VDB_EP_DATA		3
 
-// Endpoint blocks: control, bulk IN, bulk OUT (driverEndpointNumber sequential)
-static SceUdcdEndpoint endpoints[3] = {
+// Endpoint blocks: control, bulk IN, bulk OUT, bulk IN (driverEndpointNumber sequential)
+static SceUdcdEndpoint endpoints[4] = {
 	{ USB_ENDPOINT_OUT, 0, 0, 0 },
 	{ USB_ENDPOINT_IN,  1, 0, 0 },
 	{ USB_ENDPOINT_OUT, 2, 0, 0 },
+	{ USB_ENDPOINT_IN,  3, 0, 0 },
 };
 
 static SceUdcdInterface interfaces[1] = {
-	{ -1, 0, 1 },
+	{ -1, 0, 2 },
 };
 
 static SceUdcdStringDescriptor string_descriptors[2] = {
@@ -32,6 +38,8 @@ static SceUdcdStringDescriptor string_descriptors[2] = {
 		USB_DT_STRING
 	}
 };
+
+#define VDB_CONFIG_TOTAL_LENGTH	( USB_DT_CONFIG_SIZE + 2 * USB_DT_INTERFACE_SIZE + 3 * USB_DT_ENDPOINT_SIZE )
 
 // High speed
 static SceUdcdDeviceDescriptor devdesc_hi = {
@@ -51,7 +59,7 @@ static SceUdcdDeviceDescriptor devdesc_hi = {
 	1							// bNumConfigurations
 };
 
-static SceUdcdEndpointDescriptor endpdesc_hi[3] = {
+static SceUdcdEndpointDescriptor endpdesc_hi[4] = {
 	{
 		USB_DT_ENDPOINT_SIZE,
 		USB_DT_ENDPOINT,
@@ -69,17 +77,25 @@ static SceUdcdEndpointDescriptor endpdesc_hi[3] = {
 		0
 	},
 	{
+		USB_DT_ENDPOINT_SIZE,
+		USB_DT_ENDPOINT,
+		0x80 | VDB_EP_DATA,
+		0x02,
+		512,
+		0
+	},
+	{
 		0,
 	}
 };
 
-static SceUdcdInterfaceDescriptor interdesc_hi[2] = {
+static SceUdcdInterfaceDescriptor interdesc_hi[3] = {
 	{
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
-		0,							// bInterfaceNumber
+		0,							// bInterfaceNumber: logs
 		0,							// bAlternateSetting
-		2,							// bNumEndpoints
+		1,							// bNumEndpoints
 		USB_CLASS_VENDOR_SPEC,		// bInterfaceClass
 		0x00,						// bInterfaceSubClass
 		0x00,						// bInterfaceProtocol
@@ -89,23 +105,34 @@ static SceUdcdInterfaceDescriptor interdesc_hi[2] = {
 		0							// extraLength
 	},
 	{
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		1,							// bInterfaceNumber: commands and data
+		0,
+		2,
+		USB_CLASS_VENDOR_SPEC,
+		0x00,
+		0x00,
+		1,
+		&endpdesc_hi[1],
+		NULL,
+		0
+	},
+	{
 		0
 	}
 };
 
-static SceUdcdInterfaceSettings settings_hi[1] = {
-	{
-		&interdesc_hi[0],
-		0,
-		1
-	}
+static SceUdcdInterfaceSettings settings_hi[2] = {
+	{ &interdesc_hi[0], 0, 1 },
+	{ &interdesc_hi[1], 0, 1 },
 };
 
 static SceUdcdConfigDescriptor confdesc_hi = {
 	USB_DT_CONFIG_SIZE,
 	USB_DT_CONFIG,
-	( USB_DT_CONFIG_SIZE + USB_DT_INTERFACE_SIZE + 2 * USB_DT_ENDPOINT_SIZE ),	// wTotalLength
-	1,							// bNumInterfaces
+	VDB_CONFIG_TOTAL_LENGTH,	// wTotalLength
+	2,							// bNumInterfaces
 	1,							// bConfigurationValue
 	0,							// iConfiguration
 	0xC0,						// bmAttributes: self powered
@@ -138,7 +165,7 @@ static SceUdcdDeviceDescriptor devdesc_full = {
 	1
 };
 
-static SceUdcdEndpointDescriptor endpdesc_full[3] = {
+static SceUdcdEndpointDescriptor endpdesc_full[4] = {
 	{
 		USB_DT_ENDPOINT_SIZE,
 		USB_DT_ENDPOINT,
@@ -156,17 +183,25 @@ static SceUdcdEndpointDescriptor endpdesc_full[3] = {
 		0
 	},
 	{
+		USB_DT_ENDPOINT_SIZE,
+		USB_DT_ENDPOINT,
+		0x80 | VDB_EP_DATA,
+		0x02,
+		64,
+		0
+	},
+	{
 		0
 	}
 };
 
-static SceUdcdInterfaceDescriptor interdesc_full[2] = {
+static SceUdcdInterfaceDescriptor interdesc_full[3] = {
 	{
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
 		0,
 		0,
-		2,
+		1,
 		USB_CLASS_VENDOR_SPEC,
 		0x00,
 		0x00,
@@ -176,23 +211,34 @@ static SceUdcdInterfaceDescriptor interdesc_full[2] = {
 		0
 	},
 	{
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		1,
+		0,
+		2,
+		USB_CLASS_VENDOR_SPEC,
+		0x00,
+		0x00,
+		1,
+		&endpdesc_full[1],
+		NULL,
+		0
+	},
+	{
 		0
 	}
 };
 
-static SceUdcdInterfaceSettings settings_full[1] = {
-	{
-		&interdesc_full[0],
-		0,
-		1
-	}
+static SceUdcdInterfaceSettings settings_full[2] = {
+	{ &interdesc_full[0], 0, 1 },
+	{ &interdesc_full[1], 0, 1 },
 };
 
 static SceUdcdConfigDescriptor confdesc_full = {
 	USB_DT_CONFIG_SIZE,
 	USB_DT_CONFIG,
-	( USB_DT_CONFIG_SIZE + USB_DT_INTERFACE_SIZE + 2 * USB_DT_ENDPOINT_SIZE ),
-	1,
+	VDB_CONFIG_TOTAL_LENGTH,
+	2,
 	1,
 	0,
 	0xC0,

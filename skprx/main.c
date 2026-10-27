@@ -1,11 +1,15 @@
-// vdb: Vita debug bridge, kernel side (MVP).
+// vdb: Vita debug bridge, kernel side.
 //
-// A vendor USB device with one bulk IN pipe that streams a 64 KB log ring
-// to the host, and one bulk OUT pipe for commands. Writers: the vdb_write
-// syscall (any user app) and this
-// module's own heartbeat. Activated at boot only when the flag file
-// ux0:vdbplugin/usb_on exists (VitaShell's USB mass storage keeps working
-// otherwise), or from user space with vdb_usb_start().
+// A vendor USB device with three bulk pipes: EP1 IN streams a 64 KB log
+// ring to the host, EP2 OUT carries framed commands from the host, EP3 IN
+// carries the replies and file data. Log writers: the vdb_write syscall
+// (any user app) and this module's
+// own heartbeat. File commands (list, stat, get, put, mkdir, remove, rmdir,
+// rename) run on the kernel's own IO, so every mounted device is reachable
+// (ux0:, ur0:, uma0:, vs0:, os0: ...) with no app involved. Activated at
+// boot only when the flag file ux0:vdbplugin/usb_on exists (VitaShell's
+// USB mass storage keeps working otherwise), by the hotkey, or from user
+// space with vdb_usb_start().
 //
 // Host: host/vdb.py (pyusb), Sony VID 0x054C, PID VDB_USB_PID.
 //
@@ -17,6 +21,8 @@
 #include <psp2kern/kernel/sysclib.h>
 #include <psp2kern/kernel/cpu.h>
 #include <psp2kern/io/fcntl.h>
+#include <psp2kern/io/dirent.h>
+#include <psp2kern/io/stat.h>
 #include <psp2kern/udcd.h>
 #include <psp2kern/ctrl.h>
 #include <stdarg.h>
@@ -24,12 +30,13 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.1"
+#define VDB_VERSION		"0.2"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
 #define CHUNK_SIZE		4096
-#define RX_SIZE			64
+#define RX_SIZE			4096		// one command frame: header + up to 4080 bytes of payload
+#define DATA_CHUNK		( 32 * 1024 )	// reply payload per frame on EP3
 
 enum
 {
@@ -39,17 +46,62 @@ enum
 	EVF_SENT			= 1 << 3,
 	EVF_RECEIVED		= 1 << 4,
 	EVF_EXIT			= 1 << 5,
-	EVF_ALL				= 0x3F
+	EVF_ALL				= 0x3F,		// what the main loop waits on and clears
+	EVF_DSENT			= 1 << 6	// EP3 reply sent (waited for synchronously by SendReply)
 };
+
+//-----------------------------------------------------------------------------
+// Command protocol (little endian, host/vdb.py mirrors it)
+//
+// Host -> EP2: VdbCmdHdr_t + payload (paths are NUL-terminated, two for
+// RENAME). A frame is one USB transfer; the host pads a frame whose size is
+// a multiple of the packet size so the transfer terminates (short packet).
+// Device -> EP3: VdbRspHdr_t + payload. GET streams the file as data frames
+// and ends with an empty one; LIST streams text lines the same way.
+//-----------------------------------------------------------------------------
+#define VDB_CMD_MAGIC	0x31424456	// "VDB1"
+#define VDB_RSP_MAGIC	0x52424456	// "VDBR"
+
+enum
+{
+	VDB_CMD_PING		= 1,
+	VDB_CMD_STATUS		= 2,	// reply payload: status text
+	VDB_CMD_LIST		= 3,	// payload: dir path; reply frames: "d|f <size> <yyyy-mm-dd hh:mm:ss> <name>\n", final status = entry count
+	VDB_CMD_STAT		= 4,	// payload: path; reply: one such line
+	VDB_CMD_GET			= 5,	// payload: path; reply: 8-byte size, data frames, empty frame
+	VDB_CMD_PUT_OPEN	= 6,	// payload: path (truncate/create); reply: status
+	VDB_CMD_PUT_DATA	= 7,	// payload: file data (no reply)
+	VDB_CMD_PUT_CLOSE	= 8,	// reply: status, payload 8-byte bytes written
+	VDB_CMD_MKDIR		= 9,
+	VDB_CMD_REMOVE		= 10,
+	VDB_CMD_RMDIR		= 11,
+	VDB_CMD_RENAME		= 12,	// payload: "old\0new\0"
+};
+
+typedef struct
+{
+	unsigned magic, cmd, len, arg;
+} VdbCmdHdr_t;
+
+typedef struct
+{
+	unsigned magic, cmd;
+	int status;
+	unsigned len;
+} VdbRspHdr_t;
 
 static char s_Ring[RING_SIZE];
 static unsigned s_nRingWrite, s_nRingRead;	// monotonic byte counters; valid = write - read
 static unsigned s_nDropped;
 static unsigned char s_TxBuf[CHUNK_SIZE] __attribute__(( aligned( 64 ) ));
 static unsigned char s_RxBuf[RX_SIZE] __attribute__(( aligned( 64 ) ));
+static unsigned char s_DataBuf[sizeof( VdbRspHdr_t ) + DATA_CHUNK] __attribute__(( aligned( 64 ) ));
 static SceUID s_Evf = -1;
 static SceUID s_Thread = -1;
 static int s_bRegistered, s_bActive;
+static SceUID s_PutFd = -1;			// file being written by PUT_OPEN .. PUT_CLOSE
+static int s_nPutError;
+static unsigned long long s_nPutBytes;
 
 //-----------------------------------------------------------------------------
 // Log ring
@@ -123,8 +175,14 @@ static void OnReceived( SceUdcdDeviceRequest *req )
 	ksceKernelSetEventFlag( s_Evf, EVF_RECEIVED );
 }
 
+static void OnDataSent( SceUdcdDeviceRequest *req )
+{
+	ksceKernelSetEventFlag( s_Evf, EVF_DSENT );
+}
+
 static SceUdcdDeviceRequest s_TxReq;
 static SceUdcdDeviceRequest s_RxReq;
+static SceUdcdDeviceRequest s_DataReq;
 
 static int SendChunk( unsigned nLen )
 {
@@ -147,22 +205,294 @@ static int QueueReceive( void )
 	return ksceUdcdReqRecv( &s_RxReq );
 }
 
-// Commands from the host, one byte: 'P' ping, 'S' status
-static void HandleCommand( const unsigned char *pCmd, int nLen )
+//-----------------------------------------------------------------------------
+// Replies on EP3. Sent synchronously from the USB thread: one frame in
+// flight, wait for its completion (3 s), so a file streams as a sequence of
+// frames with USB flow control and nothing else to buffer. The log ring
+// pauses meanwhile and catches up afterwards (nothing is lost under 64 KB)
+//-----------------------------------------------------------------------------
+static unsigned char *ReplyPayload( void )
+{
+	return s_DataBuf + sizeof( VdbRspHdr_t );
+}
+
+static int SendReply( unsigned nCmd, int nStatus, unsigned nLen )
+{
+	VdbRspHdr_t *pHdr = (VdbRspHdr_t *)s_DataBuf;
+	if ( nLen > DATA_CHUNK )
+		nLen = DATA_CHUNK;
+	pHdr->magic = VDB_RSP_MAGIC;
+	pHdr->cmd = nCmd;
+	pHdr->status = nStatus;
+	pHdr->len = nLen;
+	ksceKernelClearEventFlag( s_Evf, ~EVF_DSENT );
+	ksceKernelDcacheCleanRange( s_DataBuf, sizeof( VdbRspHdr_t ) + nLen );
+	memset( &s_DataReq, 0, sizeof( s_DataReq ) );
+	s_DataReq.endpoint = &endpoints[VDB_EP_DATA];
+	s_DataReq.data = s_DataBuf;
+	s_DataReq.size = sizeof( VdbRspHdr_t ) + nLen;
+	s_DataReq.onComplete = OnDataSent;
+	int ret = ksceUdcdReqSend( &s_DataReq );
+	if ( ret < 0 )
+		return ret;
+	unsigned bits = 0;
+	SceUInt to = 3 * 1000 * 1000;
+	ret = ksceKernelWaitEventFlag( s_Evf, EVF_DSENT, SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &bits, &to );
+	if ( ret < 0 )
+	{
+		ksceUdcdReqCancelAll( &endpoints[VDB_EP_DATA] );
+		return ret;
+	}
+	return s_DataReq.returnCode < 0 ? s_DataReq.returnCode : 0;
+}
+
+// A text line for one directory entry or stat result
+static int FormatEntry( char *pOut, unsigned nMax, const SceIoStat *pStat, const char *pszName )
+{
+	int bDir = SCE_S_ISDIR( pStat->st_mode );
+	return snprintf( pOut, nMax, "%c %llu %04u-%02u-%02u %02u:%02u:%02u %s\n", bDir ? 'd' : 'f', (unsigned long long)pStat->st_size,
+		pStat->st_mtime.year, pStat->st_mtime.month, pStat->st_mtime.day, pStat->st_mtime.hour, pStat->st_mtime.minute, pStat->st_mtime.second,
+		pszName );
+}
+
+// LIST: stream the entries as text, final empty frame carries the count
+static void CmdList( const char *pszPath )
+{
+	SceUID dfd = ksceIoDopen( pszPath );
+	if ( dfd < 0 )
+	{
+		SendReply( VDB_CMD_LIST, dfd, 0 );
+		return;
+	}
+	static SceIoDirent ent;	// 0x160 bytes, keep it off the kernel stack
+	char *pText = (char *)ReplyPayload();
+	unsigned nUsed = 0;
+	int nCount = 0, nErr = 0;
+	for ( ;; )
+	{
+		memset( &ent, 0, sizeof( ent ) );
+		int r = ksceIoDread( dfd, &ent );
+		if ( r <= 0 )
+		{
+			if ( r < 0 )
+				nErr = r;
+			break;
+		}
+		char line[320];
+		int n = FormatEntry( line, sizeof( line ), &ent.d_stat, ent.d_name );
+		if ( n < 0 || n >= (int)sizeof( line ) )
+			continue;
+		if ( nUsed + n > DATA_CHUNK )
+		{
+			if ( SendReply( VDB_CMD_LIST, 0, nUsed ) < 0 )
+			{
+				nErr = -1;
+				break;
+			}
+			nUsed = 0;
+		}
+		memcpy( pText + nUsed, line, n );
+		nUsed += n;
+		nCount++;
+	}
+	ksceIoDclose( dfd );
+	if ( nUsed && SendReply( VDB_CMD_LIST, 0, nUsed ) < 0 )
+		return;
+	SendReply( VDB_CMD_LIST, nErr < 0 ? nErr : nCount, 0 );
+}
+
+static void CmdStat( const char *pszPath )
+{
+	SceIoStat st;
+	memset( &st, 0, sizeof( st ) );
+	int r = ksceIoGetstat( pszPath, &st );
+	if ( r < 0 )
+	{
+		SendReply( VDB_CMD_STAT, r, 0 );
+		return;
+	}
+	int n = FormatEntry( (char *)ReplyPayload(), DATA_CHUNK, &st, pszPath );
+	SendReply( VDB_CMD_STAT, 0, n > 0 ? n : 0 );
+}
+
+// GET: 8-byte size, then the file in DATA_CHUNK frames, then an empty frame
+static void CmdGet( const char *pszPath )
+{
+	SceIoStat st;
+	memset( &st, 0, sizeof( st ) );
+	int r = ksceIoGetstat( pszPath, &st );
+	SceUID fd = r < 0 ? r : ksceIoOpen( pszPath, SCE_O_RDONLY, 0 );
+	if ( fd < 0 )
+	{
+		SendReply( VDB_CMD_GET, fd, 0 );
+		return;
+	}
+	unsigned long long nSize = (unsigned long long)st.st_size;
+	memcpy( ReplyPayload(), &nSize, 8 );
+	if ( SendReply( VDB_CMD_GET, 0, 8 ) < 0 )
+	{
+		ksceIoClose( fd );
+		return;
+	}
+	int nErr = 0;
+	for ( ;; )
+	{
+		int n = ksceIoRead( fd, ReplyPayload(), DATA_CHUNK );
+		if ( n < 0 )
+		{
+			nErr = n;
+			break;
+		}
+		if ( n == 0 )
+			break;
+		if ( SendReply( VDB_CMD_GET, 0, n ) < 0 )
+		{
+			ksceIoClose( fd );
+			return;
+		}
+	}
+	ksceIoClose( fd );
+	SendReply( VDB_CMD_GET, nErr, 0 );
+}
+
+static void PutAbort( void )
+{
+	if ( s_PutFd >= 0 )
+		ksceIoClose( s_PutFd );
+	s_PutFd = -1;
+}
+
+static void CmdPutOpen( const char *pszPath )
+{
+	PutAbort();
+	s_nPutError = 0;
+	s_nPutBytes = 0;
+	s_PutFd = ksceIoOpen( pszPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777 );
+	SendReply( VDB_CMD_PUT_OPEN, s_PutFd < 0 ? s_PutFd : 0, 0 );
+}
+
+static void CmdPutData( const unsigned char *pData, unsigned nLen )
+{
+	if ( s_PutFd < 0 )
+	{
+		s_nPutError = -1;
+		return;
+	}
+	if ( s_nPutError )
+		return;
+	while ( nLen )
+	{
+		int n = ksceIoWrite( s_PutFd, pData, nLen );
+		if ( n <= 0 )
+		{
+			s_nPutError = n < 0 ? n : -1;
+			return;
+		}
+		pData += n;
+		nLen -= n;
+		s_nPutBytes += n;
+	}
+}
+
+static void CmdPutClose( void )
+{
+	int nStatus = s_nPutError;
+	if ( s_PutFd >= 0 )
+	{
+		int r = ksceIoClose( s_PutFd );
+		if ( r < 0 && !nStatus )
+			nStatus = r;
+	}
+	else if ( !nStatus )
+		nStatus = -1;
+	s_PutFd = -1;
+	memcpy( ReplyPayload(), &s_nPutBytes, 8 );
+	SendReply( VDB_CMD_PUT_CLOSE, nStatus, 8 );
+}
+
+// Commands from the host. Framed (VdbCmdHdr_t + payload), or the 0.1
+// single bytes 'P' ping and 'S' status, which only log
+static void HandleCommand( unsigned char *pCmd, int nLen )
 {
 	if ( nLen < 1 )
 		return;
-	switch ( pCmd[0] )
+	if ( nLen < (int)sizeof( VdbCmdHdr_t ) )
 	{
-	case 'P':
-		Log( "vdb: pong" );
+		if ( pCmd[0] == 'P' )
+			Log( "vdb: pong" );
+		else if ( pCmd[0] == 'S' )
+			Log( "vdb: status: ring %u used of %u, dropped %u, uptime %u s", s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped,
+				(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+		// anything else short is the host's frame padding: ignore
+		return;
+	}
+	VdbCmdHdr_t hdr;
+	memcpy( &hdr, pCmd, sizeof( hdr ) );
+	if ( hdr.magic != VDB_CMD_MAGIC )
+	{
+		Log( "vdb: bad command frame (magic 0x%08x, %d bytes)", hdr.magic, nLen );
+		return;
+	}
+	unsigned char *pPayload = pCmd + sizeof( hdr );
+	unsigned nPayload = (unsigned)nLen - sizeof( hdr );
+	if ( hdr.len < nPayload )
+		nPayload = hdr.len;	// the rest is padding
+	// paths: force termination inside the buffer
+	if ( hdr.cmd != VDB_CMD_PUT_DATA && nPayload < RX_SIZE - sizeof( hdr ) )
+		pPayload[nPayload] = 0;
+	else if ( hdr.cmd != VDB_CMD_PUT_DATA )
+		pPayload[RX_SIZE - sizeof( hdr ) - 1] = 0;
+	const char *pszPath = (const char *)pPayload;
+
+	switch ( hdr.cmd )
+	{
+	case VDB_CMD_PING:
+		SendReply( VDB_CMD_PING, 0, 0 );
 		break;
-	case 'S':
-		Log( "vdb: status: ring %u used of %u, dropped %u, uptime %u s", s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped,
-			(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+	case VDB_CMD_STATUS:
+	{
+		int n = snprintf( (char *)ReplyPayload(), DATA_CHUNK, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d\n",
+			s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), (int)s_PutFd );
+		SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 		break;
+	}
+	case VDB_CMD_LIST:
+		CmdList( pszPath );
+		break;
+	case VDB_CMD_STAT:
+		CmdStat( pszPath );
+		break;
+	case VDB_CMD_GET:
+		CmdGet( pszPath );
+		break;
+	case VDB_CMD_PUT_OPEN:
+		CmdPutOpen( pszPath );
+		break;
+	case VDB_CMD_PUT_DATA:
+		CmdPutData( pPayload, nPayload );
+		break;
+	case VDB_CMD_PUT_CLOSE:
+		CmdPutClose();
+		break;
+	case VDB_CMD_MKDIR:
+		SendReply( VDB_CMD_MKDIR, ksceIoMkdir( pszPath, 0777 ), 0 );
+		break;
+	case VDB_CMD_REMOVE:
+		SendReply( VDB_CMD_REMOVE, ksceIoRemove( pszPath ), 0 );
+		break;
+	case VDB_CMD_RMDIR:
+		SendReply( VDB_CMD_RMDIR, ksceIoRmdir( pszPath ), 0 );
+		break;
+	case VDB_CMD_RENAME:
+	{
+		unsigned nFirst = strlen( pszPath );
+		const char *pszNew = nFirst + 1 < nPayload ? pszPath + nFirst + 1 : "";
+		SendReply( VDB_CMD_RENAME, ksceIoRename( pszPath, pszNew ), 0 );
+		break;
+	}
 	default:
-		Log( "vdb: unknown command 0x%02x (%d bytes)", pCmd[0], nLen );
+		Log( "vdb: unknown command %u (%d bytes)", hdr.cmd, nLen );
+		SendReply( hdr.cmd, -2, 0 );
 		break;
 	}
 }
@@ -198,6 +528,8 @@ static int Attach( int usb_version, void *user_data )
 	ksceUdcdClearFIFO( &endpoints[VDB_EP_IN] );
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_OUT] );
 	ksceUdcdClearFIFO( &endpoints[VDB_EP_OUT] );
+	ksceUdcdReqCancelAll( &endpoints[VDB_EP_DATA] );
+	ksceUdcdClearFIFO( &endpoints[VDB_EP_DATA] );
 	ksceKernelSetEventFlag( s_Evf, EVF_CONNECTED );
 	return 0;
 }
@@ -223,7 +555,7 @@ static int DriverStop( int size, void *args, void *user_data )
 
 static SceUdcdDriver s_Driver = {
 	VDB_DRIVER_NAME,
-	3,
+	4,
 	&endpoints[0],
 	&interfaces[0],
 	&devdesc_hi,
@@ -344,6 +676,7 @@ static int UsbThread( SceSize args, void *argp )
 		{
 			bConnected = 0;
 			bSending = 0;
+			PutAbort();	// a half-written file stays, truncated; the host reports the failure
 		}
 		if ( bits & EVF_RECEIVED )
 		{

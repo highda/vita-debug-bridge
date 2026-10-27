@@ -1,3 +1,4 @@
-skprx/*.o
-skprx/*.elf
-skprx/*.velf
+__pycache__/
+*.o
+*.elf
+*.velf
