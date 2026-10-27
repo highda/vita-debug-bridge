@@ -3,13 +3,15 @@ VDB:
   version:
     major: 1
     minor: 0
+  nid: 0x8D11D799
   main:
     start: module_start
     stop: module_stop
-  modules:
+  libraries:
     VdbForUser:
       syscall: true
+      nid: 0x754B48CF
       functions:
-        - vdb_write
-        - vdb_usb_start
-        - vdb_usb_stop
+        - vdb_write: 0x921BEDED
+        - vdb_usb_start: 0xE4D803D5
+        - vdb_usb_stop: 0xB62CD7BF
