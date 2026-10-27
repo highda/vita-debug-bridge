@@ -30,12 +30,12 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.2"
+#define VDB_VERSION		"0.2.1"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
 #define CHUNK_SIZE		4096
-#define RX_SIZE			4096		// one command frame: header + up to 4080 bytes of payload
+#define RX_SIZE			( 64 * 1024 )	// one command frame: header + payload; 64 KB so a PUT costs one transfer and one card write per 64 KB (4 KB frames: 0.7 MB/s)
 #define DATA_CHUNK		( 32 * 1024 )	// reply payload per frame on EP3
 
 enum
@@ -457,8 +457,9 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 		break;
 	case VDB_CMD_STATUS:
 	{
-		int n = snprintf( (char *)ReplyPayload(), DATA_CHUNK, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d\n",
-			s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), (int)s_PutFd );
+		// "rx N" is read by the host to size its command frames
+		int n = snprintf( (char *)ReplyPayload(), DATA_CHUNK, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u\n",
+			s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), (int)s_PutFd, (unsigned)RX_SIZE );
 		SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 		break;
 	}

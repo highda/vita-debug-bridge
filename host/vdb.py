@@ -40,8 +40,7 @@ RSP = struct.Struct("<IIiI")
 (CMD_PING, CMD_STATUS, CMD_LIST, CMD_STAT, CMD_GET, CMD_PUT_OPEN, CMD_PUT_DATA,
  CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME) = range(1, 13)
 
-RX_SIZE = 4096                 # the plugin's command buffer
-PUT_CHUNK = RX_SIZE - HDR.size  # one full command buffer per data frame
+RX_SIZE_OLD = 4096             # the command buffer of vdb 0.2 (no "rx" in its status line)
 DATA_CHUNK = 32 * 1024
 TIMEOUT = 5000
 
@@ -69,14 +68,25 @@ class Bridge:
         cfg = self.dev.get_active_configuration()
         ep = usb.util.find_descriptor(cfg[(1, 0)], bEndpointAddress=EP_OUT)
         self.packet = ep.wMaxPacketSize if ep is not None else 512
+        # the plugin's command buffer sizes our frames: ask, since a frame
+        # longer than the buffer is silently cut (a 0.2 plugin fed 64 KB
+        # frames wrote 4 KB of each)
+        self.rx_size = RX_SIZE_OLD
+        self.send(CMD_STATUS)
+        _, status, data = self.reply()
+        text = data.decode("utf-8", "replace")
+        if status == 0 and ", rx " in text:
+            self.rx_size = int(text.rsplit(", rx ", 1)[1].split()[0])
+        self.status_text = text
+        self.put_chunk = self.rx_size - HDR.size
 
     def send(self, cmd, payload=b"", arg=0):
         frame = HDR.pack(CMD_MAGIC, cmd, len(payload), arg) + payload
-        if len(frame) > RX_SIZE:
+        if len(frame) > self.rx_size:
             raise ValueError("frame too long")
         # a transfer that is an exact multiple of the packet size has no short
         # packet to end it; the plugin ignores the pad byte (len is authoritative)
-        if len(frame) < RX_SIZE and len(frame) % self.packet == 0:
+        if len(frame) < self.rx_size and len(frame) % self.packet == 0:
             frame += b"\0"
         self.dev.write(EP_OUT, frame, timeout=TIMEOUT)
 
@@ -168,12 +178,12 @@ def cmd_put(b, src, dst):
     done = 0
     with open(src, "rb") as f:
         while True:
-            chunk = f.read(PUT_CHUNK)
+            chunk = f.read(b.put_chunk)
             if not chunk:
                 break
             b.send(CMD_PUT_DATA, chunk)
             done += len(chunk)
-            if done % (1 << 20) < PUT_CHUNK:
+            if done % (1 << 20) < b.put_chunk:
                 print(f"\r{done}/{size} bytes", end="", file=sys.stderr, flush=True)
     status, data = b.simple(CMD_PUT_CLOSE)
     (written,) = struct.unpack("<Q", data[:8]) if len(data) >= 8 else (0,)
@@ -200,9 +210,7 @@ def main():
         check(status, "ping")
         print(f"pong in {(time.time() - t0) * 1000:.1f} ms")
     elif cmd == "status":
-        status, data = b.simple(CMD_STATUS)
-        check(status, "status")
-        sys.stdout.write(data.decode("utf-8", "replace"))
+        sys.stdout.write(b.status_text)
     elif cmd == "ls" and len(rest) == 1:
         cmd_ls(b, rest[0])
     elif cmd == "stat" and len(rest) == 1:
