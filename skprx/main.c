@@ -38,7 +38,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.3.3"
+#define VDB_VERSION		"0.3.7"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -138,7 +138,23 @@ static char s_Ring[RING_SIZE];
 static unsigned s_nRingWrite, s_nRingRead;	// monotonic byte counters; valid = write - read
 static unsigned s_nDropped;
 static unsigned char s_TxBuf[CHUNK_SIZE] __attribute__(( aligned( 64 ) ));
-static unsigned char s_RxBuf[RX_SIZE] __attribute__(( aligned( 64 ) ));
+// Two receive buffers, one request outstanding at a time: when frame N
+// has arrived in one buffer the next receive is queued into the other
+// before frame N is written to the card, so USB fills N+1 while the card
+// takes N (one buffer: 2.9 MB/s, the transfer and the write took turns).
+// Two requests queued at once hung the endpoint (0.3.4)
+// The buffers come from a physically contiguous, uncached kernel block (as
+// udcd_uvc allocates its USB frame): the USB controller addresses them by
+// physical address. A second 64 KB buffer in the module's own .bss (0.3.4
+// to 0.3.6) was never filled by the controller, the host's writes timed
+// out; the single static buffer of 0.3.3 only worked by placement
+#define RX_BUFS 2
+static unsigned char s_RxBufStatic[RX_SIZE] __attribute__(( aligned( 64 ) ));	// fallback when the block cannot be allocated
+static unsigned char *s_pRxBuf[RX_BUFS] = { s_RxBufStatic, s_RxBufStatic };
+static int s_nRxBufs = 1;
+static SceUID s_RxBlock = -1;
+static volatile unsigned s_nRxCompleted;	// receives finished (callback), FIFO order
+static unsigned s_nRxProcessed;				// receives handled by the thread
 static unsigned char s_DataBuf[sizeof( VdbRspHdr_t ) + DATA_CHUNK] __attribute__(( aligned( 64 ) ));
 static SceUID s_Evf = -1;
 static SceUID s_Thread = -1;
@@ -216,6 +232,7 @@ static void OnSent( SceUdcdDeviceRequest *req )
 
 static void OnReceived( SceUdcdDeviceRequest *req )
 {
+	s_nRxCompleted++;
 	ksceKernelSetEventFlag( s_Evf, EVF_RECEIVED );
 }
 
@@ -225,7 +242,8 @@ static void OnDataSent( SceUdcdDeviceRequest *req )
 }
 
 static SceUdcdDeviceRequest s_TxReq;
-static SceUdcdDeviceRequest s_RxReq;
+static SceUdcdDeviceRequest s_RxReq;	// one request object, reused (0.3.4/0.3.5 alternated two and the endpoint never accepted a frame)
+static int s_nRxQueuedIdx;
 static SceUdcdDeviceRequest s_DataReq;
 
 static int SendChunk( unsigned nLen )
@@ -239,20 +257,28 @@ static int SendChunk( unsigned nLen )
 	return ksceUdcdReqSend( &s_TxReq );
 }
 
-static int QueueReceive( void )
+static int QueueReceive( int idx )
 {
 	// USB DMA writes the frame behind the CPU's back: drop any cached copy
 	// of the buffer before the transfer (and again after it, see the
 	// receive handling), or the CPU re-reads the previous command. Seen
 	// on hardware: the first command worked, every later one re-ran the
 	// old one with a garbage path
-	ksceKernelDcacheInvalidateRange( s_RxBuf, RX_SIZE );
+	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
 	memset( &s_RxReq, 0, sizeof( s_RxReq ) );
 	s_RxReq.endpoint = &endpoints[VDB_EP_OUT];
-	s_RxReq.data = s_RxBuf;
+	s_RxReq.data = s_pRxBuf[idx];
 	s_RxReq.size = RX_SIZE;
 	s_RxReq.onComplete = OnReceived;
-	return ksceUdcdReqRecv( &s_RxReq );
+	s_nRxQueuedIdx = idx;
+	int r = ksceUdcdReqRecv( &s_RxReq );
+	if ( r < 0 )
+	{
+		char note[64];
+		snprintf( note, sizeof( note ), "vdb: ReqRecv(%d) failed 0x%08x\n", idx, r );
+		FileNote( note );
+	}
+	return r;
 }
 
 //-----------------------------------------------------------------------------
@@ -1040,7 +1066,9 @@ static int UsbThread( SceSize args, void *argp )
 		{
 			bConnected = 1;
 			bSending = 0;
-			QueueReceive();
+			s_nRxCompleted = 0;
+			s_nRxProcessed = 0;
+			QueueReceive( 0 );
 			Log( "vdb: host attached (vdb " VDB_VERSION ")" );
 		}
 		if ( bits & EVF_DISCONNECTED )
@@ -1056,11 +1084,20 @@ static int UsbThread( SceSize args, void *argp )
 		}
 		if ( bits & EVF_RECEIVED )
 		{
-			if ( bConnected )
+			// completions arrive in the order the requests were queued, so
+			// the buffers are handled round robin and each is requeued
+			// right after its frame was consumed
+			if ( bConnected && s_nRxProcessed != s_nRxCompleted )
 			{
-				ksceKernelDcacheInvalidateRange( s_RxBuf, RX_SIZE );
-				HandleCommand( s_RxBuf, s_RxReq.transmitted );
-				QueueReceive();
+				// the one outstanding request finished into buffer idx:
+				// grab its length, queue the other buffer, then consume idx
+				// while USB fills the other
+				int idx = s_nRxQueuedIdx;
+				int nLen = s_RxReq.transmitted;
+				s_nRxProcessed = s_nRxCompleted;
+				QueueReceive( ( idx + 1 ) % s_nRxBufs );
+				ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
+				HandleCommand( s_pRxBuf[idx], nLen );
 			}
 		}
 		if ( bits & EVF_SENT )
@@ -1208,6 +1245,24 @@ int module_start( SceSize argc, const void *args )
 	}
 	s_bRegistered = 1;
 	InstallTouchHooks();
+	{
+		SceKernelAllocMemBlockKernelOpt opt;
+		memset( &opt, 0, sizeof( opt ) );
+		opt.size = sizeof( opt );
+		opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
+		opt.alignment = 4 * 1024;
+		s_RxBlock = ksceKernelAllocMemBlock( "vdb_rx", 0x10208006, RX_BUFS * RX_SIZE, &opt );
+		void *pBase = NULL;
+		if ( s_RxBlock >= 0 && ksceKernelGetMemBlockBase( s_RxBlock, &pBase ) >= 0 && pBase )
+		{
+			for ( int i = 0; i < RX_BUFS; i++ )
+				s_pRxBuf[i] = (unsigned char *)pBase + i * RX_SIZE;
+			s_nRxBufs = RX_BUFS;
+		}
+		char note[96];
+		snprintf( note, sizeof( note ), "vdb: rx buffers: block 0x%08x base %p, %d in use\n", (unsigned)s_RxBlock, pBase, s_nRxBufs );
+		FileNote( note );
+	}
 	// decide the auto start before the thread runs (it read the flag
 	// before module_start set it: the takeover never happened)
 	{
@@ -1241,6 +1296,8 @@ int module_start( SceSize argc, const void *args )
 
 int module_stop( SceSize argc, const void *args )
 {
+	if ( s_RxBlock >= 0 )
+		ksceKernelFreeMemBlock( s_RxBlock );
 	RemoveTouchHooks();
 	if ( s_bActive )
 		vdb_usb_stop();
