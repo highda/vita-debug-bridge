@@ -13,7 +13,7 @@
   vdb.py rmdir ux0:data/dir
   vdb.py mv ux0:data/a ux0:data/b
   vdb.py reboot                    cold reboot (also: reboot soft, poweroff, suspend)
-  vdb.py launch ABCD12345 [args]   start an installed app (a title id, or a path to an eboot.bin)
+  vdb.py launch ABCD12345          start an installed app through the shell (needs vdb_shell.suprx)
   vdb.py kill [pid]                kill a process (default: the one that owns the screen; never the shell)
   vdb.py screen [out.png]          grab the screen (default: screen-<time>.png)
   vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
@@ -315,14 +315,14 @@ def main():
         check(b.simple(CMD_RMDIR, path_arg(rest[0]))[0], f"rmdir {rest[0]}")
     elif cmd == "mv" and len(rest) == 2:
         check(b.simple(CMD_RENAME, path_arg(rest[0]) + path_arg(rest[1]))[0], f"mv {rest[0]}")
-    elif cmd == "launch" and rest:
-        target = rest[0]
-        path = target if ":" in target else f"ux0:app/{target}/eboot.bin"
-        payload = path_arg(path) + b"".join(path_arg(a) for a in rest[1:])
-        status, data = b.simple(CMD_LAUNCH, payload)
-        (pid,) = struct.unpack("<i", data[:4]) if len(data) >= 4 else (0,)
-        check(status, f"launch {path}")
-        print(f"launched {path}: pid 0x{pid:x}")
+    elif cmd == "launch" and len(rest) == 1:
+        # a title id, or a full uri such as psgm:play?titleid=ABCD12345; the
+        # shell companion (vdb_shell.suprx) starts it the way the shell does
+        status, _ = b.simple(CMD_LAUNCH, path_arg(rest[0]))
+        if status == -5:
+            sys.exit("launch: the shell companion is not running (vdb_shell.suprx under *main in config.txt)")
+        check(status, f"launch {rest[0]}")
+        print(f"launch of {rest[0]} handed to the shell; the result shows up in the log stream")
     elif cmd == "kill" and len(rest) <= 1:
         pid = int(rest[0], 0) if rest else 0
         b.send(CMD_KILL, arg=pid & 0xFFFFFFFF)
@@ -331,7 +331,7 @@ def main():
         if status == -3:
             sys.exit(f"kill: pid 0x{pid:x} is the shell, refused")
         check(status, "kill")
-        print(f"killed pid 0x{pid:x}")
+        print("asked the shell to close the running app" if pid == 0 else f"killed pid 0x{pid:x}")
     elif cmd == "screen" and len(rest) <= 1:
         cmd_screen(b, *rest)
     elif cmd == "input" and rest:

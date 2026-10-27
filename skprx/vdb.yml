@@ -15,3 +15,5 @@ VDB:
         - vdb_write: 0x921BEDED
         - vdb_usb_start: 0xE4D803D5
         - vdb_usb_stop: 0xB62CD7BF
+        - vdb_shell_poll: 0x3A1F6C02
+        - vdb_shell_result: 0x7D90E5B4

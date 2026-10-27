@@ -36,7 +36,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.3.1"
+#define VDB_VERSION		"0.3.2"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -486,24 +486,55 @@ static SceUID ScreenOwner( SceDisplayFrameBufInfo *pInfo )
 	return pInfo->pid;
 }
 
-// LAUNCH: as h-encore's payload does it, a zeroed 52-byte option block
-static void CmdLaunch( const char *pszPath, unsigned nPayload )
+// Requests for the user-side companion (vdb_shell.suprx inside SceShell):
+// launching through ksceAppMgrLaunchAppByPath from this kernel thread took
+// the whole system down twice (kernel panic, Vita off), so apps start the
+// way the shell starts them, sceAppMgrLaunchAppByUri, called by the
+// companion. The kernel only queues the request; the companion polls it
+// through the vdb_shell_poll syscall and reports the result
+static char s_ShellReq[128];
+static int s_bShellReqPending;
+static unsigned long long s_nShellLastPoll;
+
+static int ShellCompanionAlive( void )
 {
-	unsigned nPathLen = strlen( pszPath );
-	const char *pszArgs = pszPath + nPathLen + 1;
-	unsigned nArgs = nPathLen + 1 < nPayload ? nPayload - nPathLen - 1 : 0;
-	int opt[52 / 4];
-	memset( opt, 0, sizeof( opt ) );
-	opt[0] = sizeof( opt );
-	int pid = ksceAppMgrLaunchAppByPath( pszPath, nArgs ? pszArgs : NULL, nArgs, 0, (const SceAppMgrLaunchParam *)opt, NULL );
-	Log( "vdb: launch %s: 0x%08x", pszPath, pid );
-	memcpy( ReplyPayload(), &pid, 4 );
-	SendReply( VDB_CMD_LAUNCH, pid < 0 ? pid : 0, 4 );
+	return s_nShellLastPoll && ksceKernelGetSystemTimeWide() - s_nShellLastPoll < 5 * 1000 * 1000ULL;
+}
+
+// LAUNCH: payload is a title id ("ABCD12345") or a full uri ("psgm:play?titleid=...")
+static void CmdLaunch( const char *pszWhat, unsigned nPayload )
+{
+	if ( !ShellCompanionAlive() )
+	{
+		SendReply( VDB_CMD_LAUNCH, -5, 0 );	// no companion in the shell
+		return;
+	}
+	if ( strchr( pszWhat, ':' ) )
+		snprintf( s_ShellReq, sizeof( s_ShellReq ), "%s", pszWhat );
+	else
+		snprintf( s_ShellReq, sizeof( s_ShellReq ), "psgm:play?titleid=%s", pszWhat );
+	s_bShellReqPending = 1;
+	Log( "vdb: launch request queued for the shell: %s", s_ShellReq );
+	SendReply( VDB_CMD_LAUNCH, 0, 0 );
+}
+
+static void QueueShellDestroy( void )
+{
+	snprintf( s_ShellReq, sizeof( s_ShellReq ), "destroy" );
+	s_bShellReqPending = 1;
 }
 
 static void CmdKill( int pid )
 {
 	SceDisplayFrameBufInfo info;
+	if ( pid == 0 && ShellCompanionAlive() )
+	{
+		// the shell closes the running app the way the user would
+		QueueShellDestroy();
+		memset( ReplyPayload(), 0, 4 );
+		SendReply( VDB_CMD_KILL, 0, 4 );
+		return;
+	}
 	if ( pid == 0 )
 		pid = ScreenOwner( &info );
 	SceUID shell = ksceKernelSysrootGetShellPid();
@@ -939,6 +970,29 @@ static int UsbThread( SceSize args, void *argp )
 //-----------------------------------------------------------------------------
 // Exports to user space (syscalls, see vdb.yml)
 //-----------------------------------------------------------------------------
+// Companion syscalls (vdb_shell.suprx). poll: copies a pending request to
+// the caller and returns its length, 0 when there is none
+int vdb_shell_poll( char *pUserOut, unsigned nSize )
+{
+	s_nShellLastPoll = ksceKernelGetSystemTimeWide();
+	if ( !s_bShellReqPending || !pUserOut || nSize < 2 )
+		return 0;
+	unsigned n = strlen( s_ShellReq ) + 1;
+	if ( n > nSize )
+		n = nSize;
+	s_ShellReq[n - 1] = 0;
+	if ( ksceKernelMemcpyKernelToUser( pUserOut, s_ShellReq, n ) < 0 )
+		return -1;
+	s_bShellReqPending = 0;
+	return (int)n;
+}
+
+int vdb_shell_result( int nCode )
+{
+	Log( "vdb: shell companion: request done, result 0x%08x", nCode );
+	return 0;
+}
+
 int vdb_write( const char *pUser, unsigned nLen )
 {
 	char buf[512];

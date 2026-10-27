@@ -1,1 +1,1 @@
-VDB_VdbForUser_vdb_write_365.o VDB_VdbForUser_vdb_usb_start_365.o VDB_VdbForUser_vdb_usb_stop_365.o
+VDB_VdbForUser_vdb_write_365.o VDB_VdbForUser_vdb_usb_start_365.o VDB_VdbForUser_vdb_usb_stop_365.o VDB_VdbForUser_vdb_shell_poll_365.o VDB_VdbForUser_vdb_shell_result_365.o
