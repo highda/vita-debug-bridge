@@ -38,13 +38,13 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.3.8"
+#define VDB_VERSION		"0.3.10"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
 #define CHUNK_SIZE		4096
 #define RX_SIZE			( 256 * 1024 )	// one command frame: header + payload. A PUT costs one transfer and one card write per frame: 4 KB frames 0.7 MB/s, 64 KB 2.4, 256 KB 6.0 (SD2Vita)
-#define DATA_CHUNK		( 32 * 1024 )	// reply payload per frame on EP3
+#define DATA_CHUNK		( 64 * 1024 )	// reply payload per frame on EP3 (GET, SCREEN)
 
 enum
 {
@@ -155,7 +155,10 @@ static int s_nRxBufs = 1;
 static SceUID s_RxBlock = -1;
 static volatile unsigned s_nRxCompleted;	// receives finished (callback), FIFO order
 static unsigned s_nRxProcessed;				// receives handled by the thread
-static unsigned char s_DataBuf[sizeof( VdbRspHdr_t ) + DATA_CHUNK] __attribute__(( aligned( 64 ) ));
+// Reply frames are sent from the same contiguous block (see s_pRxBuf); this static copy is the fallback
+static unsigned char s_DataBufStatic[sizeof( VdbRspHdr_t ) + 4096] __attribute__(( aligned( 64 ) ));
+static unsigned char *s_DataBuf = s_DataBufStatic;
+static unsigned s_nDataChunk = 4096;
 static SceUID s_Evf = -1;
 static SceUID s_Thread = -1;
 static int s_bRegistered, s_bActive;
@@ -295,8 +298,8 @@ static unsigned char *ReplyPayload( void )
 static int SendReply( unsigned nCmd, int nStatus, unsigned nLen )
 {
 	VdbRspHdr_t *pHdr = (VdbRspHdr_t *)s_DataBuf;
-	if ( nLen > DATA_CHUNK )
-		nLen = DATA_CHUNK;
+	if ( nLen > s_nDataChunk )
+		nLen = s_nDataChunk;
 	pHdr->magic = VDB_RSP_MAGIC;
 	pHdr->cmd = nCmd;
 	pHdr->status = nStatus;
@@ -358,7 +361,7 @@ static void CmdList( const char *pszPath )
 		int n = FormatEntry( line, sizeof( line ), &ent.d_stat, ent.d_name );
 		if ( n < 0 || n >= (int)sizeof( line ) )
 			continue;
-		if ( nUsed + n > DATA_CHUNK )
+		if ( nUsed + n > s_nDataChunk )
 		{
 			if ( SendReply( VDB_CMD_LIST, 0, nUsed ) < 0 )
 			{
@@ -387,7 +390,7 @@ static void CmdStat( const char *pszPath )
 		SendReply( VDB_CMD_STAT, r, 0 );
 		return;
 	}
-	int n = FormatEntry( (char *)ReplyPayload(), DATA_CHUNK, &st, pszPath );
+	int n = FormatEntry( (char *)ReplyPayload(), s_nDataChunk, &st, pszPath );
 	SendReply( VDB_CMD_STAT, 0, n > 0 ? n : 0 );
 }
 
@@ -413,7 +416,7 @@ static void CmdGet( const char *pszPath )
 	int nErr = 0;
 	for ( ;; )
 	{
-		int n = ksceIoRead( fd, ReplyPayload(), DATA_CHUNK );
+		int n = ksceIoRead( fd, ReplyPayload(), s_nDataChunk );
 		if ( n < 0 )
 		{
 			nErr = n;
@@ -704,8 +707,8 @@ static void CmdScreen( void )
 	while ( nDone < hdr.bytes )
 	{
 		unsigned n = hdr.bytes - nDone;
-		if ( n > DATA_CHUNK )
-			n = DATA_CHUNK;
+		if ( n > s_nDataChunk )
+			n = s_nDataChunk;
 		int r = ksceKernelCopyFromUserProc( pid, ReplyPayload(), pSrc + nDone, n );
 		if ( r < 0 )
 		{
@@ -761,7 +764,7 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 	case VDB_CMD_STATUS:
 	{
 		// "rx N" is read by the host to size its command frames
-		int n = snprintf( (char *)ReplyPayload(), DATA_CHUNK, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u\n",
+		int n = snprintf( (char *)ReplyPayload(), s_nDataChunk, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u\n",
 			s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), (int)s_PutFd, (unsigned)RX_SIZE );
 		SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 		break;
@@ -1251,13 +1254,16 @@ int module_start( SceSize argc, const void *args )
 		opt.size = sizeof( opt );
 		opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
 		opt.alignment = 4 * 1024;
-		s_RxBlock = ksceKernelAllocMemBlock( "vdb_rx", 0x10208006, RX_BUFS * RX_SIZE, &opt );
+		const unsigned nDataBuf = ( sizeof( VdbRspHdr_t ) + DATA_CHUNK + 4095 ) & ~4095u;
+		s_RxBlock = ksceKernelAllocMemBlock( "vdb_usb", 0x10208006, RX_BUFS * RX_SIZE + nDataBuf, &opt );
 		void *pBase = NULL;
 		if ( s_RxBlock >= 0 && ksceKernelGetMemBlockBase( s_RxBlock, &pBase ) >= 0 && pBase )
 		{
 			for ( int i = 0; i < RX_BUFS; i++ )
 				s_pRxBuf[i] = (unsigned char *)pBase + i * RX_SIZE;
 			s_nRxBufs = RX_BUFS;
+			s_DataBuf = (unsigned char *)pBase + RX_BUFS * RX_SIZE;
+			s_nDataChunk = DATA_CHUNK;
 		}
 		char note[96];
 		snprintf( note, sizeof( note ), "vdb: rx buffers: block 0x%08x base %p, %d in use\n", (unsigned)s_RxBlock, pBase, s_nRxBufs );

@@ -58,7 +58,7 @@ BUTTONS = {"select": 0x1, "l3": 0x2, "r3": 0x4, "start": 0x8, "up": 0x10, "right
 POWER_ACTIONS = {"reboot": 0, "soft": 1, "poweroff": 2, "suspend": 3}
 
 RX_SIZE_OLD = 4096             # the command buffer of vdb 0.2 (no "rx" in its status line)
-DATA_CHUNK = 32 * 1024
+DATA_CHUNK = 1024 * 1024       # largest reply frame any plugin version sends (0.3.9: 256 KB)
 TIMEOUT = 5000
 
 
