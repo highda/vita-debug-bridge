@@ -8,6 +8,8 @@
   vdb.py stat ux0:data/x.bin       one entry
   vdb.py get ux0:data/x.bin [dst]  copy a file from the Vita (dst defaults to the basename)
   vdb.py put src ux0:data/x.bin    copy a file to the Vita (created or truncated)
+  vdb.py install game.vpk ABCD12345  write a VPK's files over an installed app (ux0:app/<id>/),
+                                   no VitaShell; the title must already be installed once
   vdb.py mkdir ux0:data/dir
   vdb.py rm ux0:data/x.bin
   vdb.py rmdir ux0:data/dir
@@ -202,6 +204,46 @@ def cmd_get(b, src, dst=None):
         sys.exit(f"size mismatch: expected {size}")
 
 
+def put_bytes(b, data, dst, label=None):
+    status, _ = b.simple(CMD_PUT_OPEN, path_arg(dst))
+    check(status, f"put open {dst}")
+    for i in range(0, len(data), b.put_chunk):
+        b.send(CMD_PUT_DATA, data[i:i + b.put_chunk])
+    status, rdata = b.simple(CMD_PUT_CLOSE)
+    (written,) = struct.unpack("<Q", rdata[:8]) if len(rdata) >= 8 else (0,)
+    check(status, f"put {dst}")
+    if written != len(data):
+        sys.exit(f"{dst}: wrote {written}, expected {len(data)}")
+
+
+def cmd_install(b, vpk, title):
+    import zipfile
+    root = f"ux0:app/{title}/"
+    status, _ = b.simple(CMD_STAT, path_arg(root + "eboot.bin"))
+    if status < 0:
+        sys.exit(f"install: {root}eboot.bin not found; install the title once with VitaShell first")
+    t0 = time.time()
+    total = 0
+    dirs = set()
+    with zipfile.ZipFile(vpk) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename.lstrip("/")
+            parts = name.split("/")
+            for i in range(1, len(parts)):
+                d = "/".join(parts[:i])
+                if d not in dirs:
+                    b.simple(CMD_MKDIR, path_arg(root + d))  # exists already: fine
+                    dirs.add(d)
+            data = z.read(info)
+            put_bytes(b, data, root + name)
+            total += len(data)
+            print(f"\r{name}: {len(data)} bytes            ", end="", file=sys.stderr, flush=True)
+    dt = max(time.time() - t0, 1e-6)
+    print(f"\rinstalled {vpk} over {root}: {total} bytes in {dt:.1f} s ({total / dt / 1e6:.1f} MB/s)      ", file=sys.stderr)
+
+
 def cmd_put(b, src, dst):
     size = os.path.getsize(src)
     status, _ = b.simple(CMD_PUT_OPEN, path_arg(dst))
@@ -328,6 +370,8 @@ def main():
         cmd_get(b, *rest)
     elif cmd == "put" and len(rest) == 2:
         cmd_put(b, rest[0], rest[1])
+    elif cmd == "install" and len(rest) == 2:
+        cmd_install(b, rest[0], rest[1])
     elif cmd == "mkdir" and len(rest) == 1:
         check(b.simple(CMD_MKDIR, path_arg(rest[0]))[0], f"mkdir {rest[0]}")
     elif cmd == "rm" and len(rest) == 1:
