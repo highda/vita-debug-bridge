@@ -18,6 +18,7 @@
 #include <psp2kern/kernel/cpu.h>
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/udcd.h>
+#include <psp2kern/ctrl.h>
 #include <stdarg.h>
 #include "usb_descriptors.h"
 
@@ -249,6 +250,7 @@ static SceUdcdDriver s_Driver = {
 //-----------------------------------------------------------------------------
 static int s_bAutoStart;	// ux0:vdbplugin/usb_on existed at boot
 int vdb_usb_start( void );
+int vdb_usb_stop( void );
 
 static int UsbThread( SceSize args, void *argp )
 {
@@ -281,6 +283,10 @@ static int UsbThread( SceSize args, void *argp )
 			(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
 		FileNote( note );
 	}
+	// Hotkeys, polled every 200 ms: L+R+Start+Select toggles the bridge,
+	// L+R+Start+Up writes a status line to boot.txt. Edge-triggered
+	unsigned nPrevButtons = 0, nTicks = 0;
+	nTimeout = 200 * 1000;
 	for ( ;; )
 	{
 		unsigned int bits = 0;
@@ -290,10 +296,36 @@ static int UsbThread( SceSize args, void *argp )
 			break;
 		if ( ret < 0 )
 		{
-			// timeout: heartbeat
-			Log( "vdb: alive %u (uptime %u s, ring %u used, dropped %u, host %s)", ++nBeats,
-				(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), s_nRingWrite - s_nRingRead, s_nDropped, bConnected ? "attached" : "none" );
 			bits = 0;
+			if ( ++nTicks % 25 == 0 )
+				Log( "vdb: alive %u (uptime %u s, ring %u used, dropped %u, host %s)", ++nBeats,
+					(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), s_nRingWrite - s_nRingRead, s_nDropped, bConnected ? "attached" : "none" );
+			SceCtrlData pad;
+			memset( &pad, 0, sizeof( pad ) );
+			if ( ksceCtrlPeekBufferPositive( 0, &pad, 1 ) > 0 )
+			{
+				const unsigned nCombo = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_START;
+				unsigned nNow = pad.buttons, nPressed = nNow & ~nPrevButtons;
+				nPrevButtons = nNow;
+				if ( ( nNow & nCombo ) == nCombo && ( nPressed & SCE_CTRL_SELECT ) )
+				{
+					int r = s_bActive ? vdb_usb_stop() : vdb_usb_start();
+					char note[96];
+					snprintf( note, sizeof( note ), "vdb: hotkey %s: 0x%08x (uptime %u s)\n", s_bActive ? "bridge on" : "bridge off", r,
+						(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+					FileNote( note );
+					Log( "%s", note );
+				}
+				else if ( ( nNow & nCombo ) == nCombo && ( nPressed & SCE_CTRL_UP ) )
+				{
+					char note[128];
+					snprintf( note, sizeof( note ), "vdb: status: usb %s, host %s, ring %u used of %u, dropped %u, uptime %u s\n",
+						s_bActive ? "bridge" : "system", bConnected ? "attached" : "none", s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped,
+						(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+					FileNote( note );
+					Log( "%s", note );
+				}
+			}
 		}
 		if ( bits & EVF_EXIT )
 			break;
