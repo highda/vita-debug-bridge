@@ -1,0 +1,15 @@
+VDB:
+  attributes: 0
+  version:
+    major: 1
+    minor: 0
+  main:
+    start: module_start
+    stop: module_stop
+  modules:
+    VdbForUser:
+      syscall: true
+      functions:
+        - vdb_write
+        - vdb_usb_start
+        - vdb_usb_stop
