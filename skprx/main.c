@@ -266,8 +266,14 @@ static int UsbThread( SceSize args, void *argp )
 		memset( &wp, 0, sizeof( wp ) );
 		wp.status = SCE_UDCD_STATUS_ACTIVATED;
 		wp.driverName = "USB_MTP_Driver";
-		int w = ksceUdcdWaitState( &wp, 90 * 1000 * 1000 );
-		ksceKernelDelayThread( 2 * 1000 * 1000 );
+		FileNote( "vdb: thread up, waiting for the MTP driver (30 s max)\n" );
+		int w = ksceUdcdWaitState( &wp, 30 * 1000 * 1000 );
+		{
+			char n2[96];
+			snprintf( n2, sizeof( n2 ), "vdb: mtp wait returned 0x%08x at uptime %u s, pausing 3 s\n", w, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
+			FileNote( n2 );
+		}
+		ksceKernelDelayThread( 3 * 1000 * 1000 );
 		int ret = vdb_usb_start();
 		Log( "vdb: usb start after boot: 0x%08x (mtp wait 0x%08x)", ret, w );
 		char note[96];
@@ -357,17 +363,23 @@ int vdb_usb_start( void )
 		return -1;
 	if ( s_bActive )
 		return 0;
+	char step[96];
 	ret = ksceUdcdDeactivate();
+	snprintf( step, sizeof( step ), "vdb: deactivate 0x%08x\n", ret ); FileNote( step );
 	if ( ret < 0 && ret != SCE_UDCD_ERROR_INVALID_ARGUMENT )
 		return ret;
-	ksceUdcdStop( "USB_MTP_Driver", 0, NULL );
+	ret = ksceUdcdStop( "USB_MTP_Driver", 0, NULL );
+	snprintf( step, sizeof( step ), "vdb: stop mtp 0x%08x\n", ret ); FileNote( step );
 	ksceUdcdStop( "USBPSPCommunicationDriver", 0, NULL );
 	ksceUdcdStop( "USBSerDriver", 0, NULL );
-	ksceUdcdStop( "USBDeviceControllerDriver", 0, NULL );
+	ret = ksceUdcdStop( "USBDeviceControllerDriver", 0, NULL );
+	snprintf( step, sizeof( step ), "vdb: stop controller 0x%08x\n", ret ); FileNote( step );
 	ret = ksceUdcdStart( "USBDeviceControllerDriver", 0, NULL );
+	snprintf( step, sizeof( step ), "vdb: start controller 0x%08x\n", ret ); FileNote( step );
 	if ( ret < 0 )
 		return ret;
 	ret = ksceUdcdStart( VDB_DRIVER_NAME, 0, NULL );
+	snprintf( step, sizeof( step ), "vdb: start vdb driver 0x%08x\n", ret ); FileNote( step );
 	if ( ret < 0 )
 	{
 		ksceUdcdStop( "USBDeviceControllerDriver", 0, NULL );
@@ -375,6 +387,7 @@ int vdb_usb_start( void )
 	}
 	ksceKernelClearEventFlag( s_Evf, ~EVF_ALL );
 	ret = ksceUdcdActivate( VDB_USB_PID );
+	snprintf( step, sizeof( step ), "vdb: activate 0x%08x\n", ret ); FileNote( step );
 	if ( ret < 0 )
 	{
 		ksceUdcdStop( VDB_DRIVER_NAME, 0, NULL );
