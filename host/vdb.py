@@ -130,6 +130,7 @@ def cmd_ls(b, path):
         if data:
             sys.stdout.write(data.decode("utf-8", "replace"))
             continue
+        sys.stdout.flush()
         check(status, f"ls {path}")
         print(f"{status} entries", file=sys.stderr)
         return
@@ -151,9 +152,10 @@ def cmd_get(b, src, dst=None):
                 break
             f.write(data)
             done += len(data)
-            print(f"\r{done}/{size} bytes", end="", file=sys.stderr, flush=True)
+            if done % (1 << 20) < DATA_CHUNK:
+                print(f"\r{done}/{size} bytes", end="", file=sys.stderr, flush=True)
     dt = max(time.time() - t0, 1e-6)
-    print(f"\r{src} -> {dst}: {done} bytes in {dt:.1f} s ({done / dt / 1e6:.1f} MB/s)", file=sys.stderr)
+    print(f"\r{src} -> {dst}: {done} bytes in {dt:.1f} s ({done / dt / 1e6:.1f} MB/s)   ", file=sys.stderr)
     if done != size:
         sys.exit(f"size mismatch: expected {size}")
 
@@ -176,7 +178,7 @@ def cmd_put(b, src, dst):
     status, data = b.simple(CMD_PUT_CLOSE)
     (written,) = struct.unpack("<Q", data[:8]) if len(data) >= 8 else (0,)
     dt = max(time.time() - t0, 1e-6)
-    print(f"\r{src} -> {dst}: {written} bytes in {dt:.1f} s ({written / dt / 1e6:.1f} MB/s)", file=sys.stderr)
+    print(f"\r{src} -> {dst}: {written} bytes in {dt:.1f} s ({written / dt / 1e6:.1f} MB/s)   ", file=sys.stderr)
     check(status, f"put {dst}")
     if written != size:
         sys.exit(f"size mismatch: wrote {written}, expected {size}")

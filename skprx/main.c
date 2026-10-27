@@ -3,7 +3,7 @@
 // A vendor USB device with three bulk pipes: EP1 IN streams a 64 KB log
 // ring to the host, EP2 OUT carries framed commands from the host, EP3 IN
 // carries the replies and file data. Log writers: the vdb_write syscall
-// (any user app) and this module's
+// (any user app that mirrors its debug log into it) and this module's
 // own heartbeat. File commands (list, stat, get, put, mkdir, remove, rmdir,
 // rename) run on the kernel's own IO, so every mounted device is reachable
 // (ux0:, ur0:, uma0:, vs0:, os0: ...) with no app involved. Activated at
