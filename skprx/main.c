@@ -197,6 +197,12 @@ static int SendChunk( unsigned nLen )
 
 static int QueueReceive( void )
 {
+	// USB DMA writes the frame behind the CPU's back: drop any cached copy
+	// of the buffer before the transfer (and again after it, see the
+	// receive handling), or the CPU re-reads the previous command. Seen
+	// on hardware: the first command worked, every later one re-ran the
+	// old one with a garbage path
+	ksceKernelDcacheInvalidateRange( s_RxBuf, RX_SIZE );
 	memset( &s_RxReq, 0, sizeof( s_RxReq ) );
 	s_RxReq.endpoint = &endpoints[VDB_EP_OUT];
 	s_RxReq.data = s_RxBuf;
@@ -682,6 +688,7 @@ static int UsbThread( SceSize args, void *argp )
 		{
 			if ( bConnected )
 			{
+				ksceKernelDcacheInvalidateRange( s_RxBuf, RX_SIZE );
 				HandleCommand( s_RxBuf, s_RxReq.transmitted );
 				QueueReceive();
 			}
