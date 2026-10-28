@@ -4,6 +4,22 @@
 static SceUID s_Thread = -1;
 static int s_bAutoStart;	// ux0:vdbplugin/usb_on existed at boot
 int g_nAwakeMode;		// off by default: the Vita sleeps and charges as it would without the plugin
+int g_bStatusOsd;
+
+// The status overlay: every marker that matters when the Mac sees nothing
+void StatusOsdTick( void )
+{
+	static unsigned s_nLast;
+	if ( !g_bStatusOsd || Uptime() == s_nLast )
+		return;
+	s_nLast = Uptime();
+	char text[6 * 64];
+	int n = snprintf( text, sizeof( text ), "vdb " VDB_VERSION " up %us batt %d%% %dmAh chg %d awake %d ring %u/%u\n",
+		Uptime(), kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), kscePowerGetBatteryChargingStatus(), g_nAwakeMode, RingUsed(), RING_SIZE );
+	if ( n > 0 && n < (int)sizeof( text ) )
+		UsbStatusLines( text + n, sizeof( text ) - n );
+	OsdSet( text );
+}
 
 //-----------------------------------------------------------------------------
 // USB thread: streams the ring while a host is attached, runs the commands,
@@ -23,14 +39,21 @@ static void Hotkeys( unsigned *pnPrevButtons )
 	*pnPrevButtons = nNow;
 	if ( ( nNow & nToggle ) == nToggle && ( nPrev & nToggle ) != nToggle )
 	{
+		UsbRetakeReset();
 		int r = g_bActive ? vdb_usb_stop() : vdb_usb_start();
 		FileNotef( "vdb: hotkey %s: 0x%08x (uptime %u s)", g_bActive ? "bridge on" : "bridge off", r, Uptime() );
 		Log( "vdb: hotkey %s: 0x%08x", g_bActive ? "bridge on" : "bridge off", r );
 	}
 	else if ( ( nNow & nStatus ) == nStatus && ( nPrev & nStatus ) != nStatus )
 	{
-		FileNotef( "vdb: status: usb %s, host %s, ring %u used of %u, dropped %u, uptime %u s",
-			g_bActive ? "bridge" : "system", g_bHostAttached ? "attached" : "none", RingUsed(), RING_SIZE, RingDropped(), Uptime() );
+		// toggles the status overlay and leaves a note either way
+		g_bStatusOsd = !g_bStatusOsd;
+		if ( !g_bStatusOsd )
+			OsdSet( "" );
+		char lines[3 * 64];
+		UsbStatusLines( lines, sizeof( lines ) );
+		FileNotef( "vdb: status hotkey (overlay %s): usb %s, host %s, ring %u used of %u, dropped %u, uptime %u s\n%s",
+			g_bStatusOsd ? "on" : "off", g_bActive ? "bridge" : "system", g_bHostAttached ? "attached" : "none", RingUsed(), RING_SIZE, RingDropped(), Uptime(), lines );
 	}
 }
 
@@ -90,6 +113,7 @@ static int UsbThread( SceSize args, void *argp )
 			}
 			InputTick();
 			UsbWatchdog();
+			StatusOsdTick();
 			if ( nTicks % 5 == 0 )
 				UsbRetakeIfLost();
 			Hotkeys( &nPrevButtons );

@@ -83,7 +83,7 @@ void FileNote( const char *pszText )
 
 void FileNotef( const char *fmt, ... )
 {
-	char line[160];
+	char line[400];
 	va_list args;
 	va_start( args, fmt );
 	int n = vsnprintf( line, sizeof( line ) - 2, fmt, args );

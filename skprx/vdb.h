@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.7.0"
+#define VDB_VERSION		"0.7.1"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_NOTE_FILE	VDB_DIR "boot.txt"
@@ -172,6 +172,10 @@ void UsbRetakeIfLost( void );			// the system took the port (an app launch): tak
 void UsbInstallSuspendHandler( void );	// standby: hands off during the system's suspend, retakes after resume
 int UsbSuspended( void );				// the system is between suspend and resume
 const char *UsbSuspendNotes( void );	// the last suspend/resume event ids, for the log
+void UsbStatusLines( char *pBuf, unsigned nSize );	// three lines of USB state for the status overlay
+void UsbRetakeReset( void );			// an explicit start (hotkey, host) clears the give-up
+extern int g_bStatusOsd;				// the status overlay (hotkey L+R+Start+Up, or osd "@status")
+void StatusOsdTick( void );				// refreshes the overlay once a second while it is on
 extern int g_nAwakeMode;				// VDB_CMD_AWAKE: 0 none, 1 no standby, 2 no standby and no screen off
 int vdb_usb_start( void );
 int vdb_usb_stop( void );

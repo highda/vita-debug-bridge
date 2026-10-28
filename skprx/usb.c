@@ -38,6 +38,8 @@ static int s_nRxQueuedIdx;
 static volatile int s_bRxOutstanding;
 static volatile unsigned s_nRxCompleted;	// receives finished (callback)
 static unsigned s_nRxProcessed;				// receives handled by the thread
+static unsigned s_nLastRecvError;			// for the status overlay
+static unsigned s_nRetakes, s_nRetakeFailures, s_nLastRetakeResult;
 
 //-----------------------------------------------------------------------------
 // Transfer completions (UDCD callbacks) and the transfers
@@ -99,13 +101,18 @@ static int QueueReceive( int idx )
 			s_bRxOutstanding = 0;
 			if ( r == SCE_UDCD_ERROR_BUS_DRIVER_NOT_STARTED )
 			{
-				// the controller driver is down (a cable event, a reset from
-				// the host, an app launch): the port is gone, retrying is
-				// pointless; the thread's retake brings it back
-				FileNotef( "vdb: ReqRecv(%d): bus driver not started, port lost (uptime %u s)", idx, Uptime() );
-				g_bActive = 0;
+				// the cable is out, the bus is suspended or the controller
+				// is down: the host is gone for now and the next Attach
+				// queues again. 0.6.9 to 0.7.0 declared the port lost here
+				// and retook it, which deactivated our own device in the
+				// middle of the controller's cable-out handling and left
+				// the controller stuck "in progress" until a cold boot
+				s_nLastRecvError = (unsigned)r;
+				g_bHostAttached = 0;
+				FileNotef( "vdb: ReqRecv(%d): bus driver not started, waiting for the next attach (usb state 0x%x, uptime %u s)", idx, (unsigned)ksceUdcdGetDeviceState(), Uptime() );
 				return r;
 			}
+			s_nLastRecvError = (unsigned)r;
 			if ( nTry == 0 || nTry == 49 )
 				FileNotef( "vdb: ReqRecv(%d) failed 0x%08x (try %d)", idx, r, nTry + 1 );
 		}
@@ -463,42 +470,95 @@ int vdb_usb_stop( void )
 // returns -1, the controller is not in the class driver list, so the check
 // 0.3.1 to 0.6.12 made on it never fired.) Never inside the suspend
 // window, and at most once in five seconds
-// A failed retake backs off (5, 10, 20, 40, 60 s) and after eight failures
-// in a row the thread leaves the port alone until the hotkey or a reboot:
-// a retake that cannot succeed must not hammer the UDCD stack forever
+// What counts as lost, learned from the boot notes of 0.6.x and 0.7.0:
+//  - the system activated its own device (an app launch re-activates the
+//    Content Manager, MTP shows ACTIVATED): the full takeover is needed;
+//  - the controller is up and the cable in, but no device is activated
+//    (state DEACTIVATED, 0x100) for ten seconds: a plain activate suffices.
+// Not lost: the cable out, the bus suspended or the controller stopped.
+// Those are the controller's own transitions (cable-out handling, standby,
+// resume); a deactivate or stop from us in the middle of them left the
+// controller stuck "in progress" (0x80243006 forever, VitaShell's USB mode
+// included) until a cold boot. A failed retake backs off (5 to 60 s) and
+// after eight failures the thread leaves the port alone until a hotkey or
+// host start
 void UsbRetakeIfLost( void )
 {
-	static unsigned s_nLastRetake, s_nWait = 5, s_nFailures;
+	static unsigned s_nLastRetake, s_nWait = 5, s_nDeactivatedSince;
 	if ( !s_bWantPort || UsbSuspended() )
 		return;
 	int mtp = ksceUdcdGetDrvState( "USB_MTP_Driver" );
 	unsigned st = (unsigned)ksceUdcdGetDeviceState();
-	int bLost = !g_bActive || ( mtp & SCE_UDCD_STATUS_ACTIVATED ) || !( st & 0x2000 ) || !( st & SCE_UDCD_STATUS_ACTIVATED );
-	if ( !bLost )
+	int bControllerUp = ( st & 0x2000 ) != 0;
+	int bSystemTook = bControllerUp && ( mtp & SCE_UDCD_STATUS_ACTIVATED );
+	int bNobodyActive = bControllerUp && ( st & SCE_UDCD_STATUS_DEACTIVATED ) && ( st & SCE_UDCD_STATUS_CABLE_CONNECTED ) && !( mtp & SCE_UDCD_STATUS_ACTIVATED );
+	if ( !bNobodyActive )
+		s_nDeactivatedSince = 0;
+	else if ( !s_nDeactivatedSince )
+		s_nDeactivatedSince = Uptime();
+	int bReactivate = bNobodyActive && Uptime() - s_nDeactivatedSince >= 10;
+	if ( !bSystemTook && !bReactivate )
 	{
-		s_nWait = 5;
-		s_nFailures = 0;
+		if ( st & SCE_UDCD_STATUS_ACTIVATED )
+		{
+			s_nWait = 5;
+			s_nRetakeFailures = 0;
+		}
 		return;
 	}
 	if ( Uptime() - s_nLastRetake < s_nWait )
 		return;
-	if ( s_nFailures >= 8 )
+	if ( s_nRetakeFailures >= 8 )
 	{
-		if ( s_nFailures == 8 )
+		if ( s_nRetakeFailures == 8 )
 			FileNotef( "vdb: port retake given up after 8 failures (usb state 0x%x, uptime %u s)", st, Uptime() );
-		s_nFailures = 9;
+		s_nRetakeFailures = 9;
 		return;
 	}
 	s_nLastRetake = Uptime();
-	g_bActive = 0;
-	g_bHostAttached = 0;
-	PutAbort();
-	int r = vdb_usb_start();
+	s_nRetakes++;
+	int r;
+	if ( bSystemTook )
+	{
+		g_bActive = 0;
+		g_bHostAttached = 0;
+		PutAbort();
+		r = vdb_usb_start();
+	}
+	else
+	{
+		ksceKernelClearEventFlag( g_Evf, ~EVF_ALL );
+		r = ksceUdcdActivate( VDB_USB_PID );
+		if ( r >= 0 )
+			g_bActive = 1;
+	}
+	s_nLastRetakeResult = (unsigned)r;
 	if ( r < 0 )
 	{
-		s_nFailures++;
+		s_nRetakeFailures++;
 		s_nWait = s_nWait < 60 ? s_nWait * 2 : 60;
 	}
-	Log( "vdb: the USB port was lost (mtp state 0x%x, usb state 0x%x), retaken: 0x%08x", mtp, st, r );
-	FileNotef( "vdb: port retaken (mtp 0x%x, usb state 0x%x): 0x%08x (uptime %u s, failures %u)", mtp, st, r, Uptime(), s_nFailures );
+	Log( "vdb: the USB port was %s (mtp state 0x%x, usb state 0x%x), %s: 0x%08x", bSystemTook ? "taken by the system" : "left deactivated", mtp, st, bSystemTook ? "retaken" : "re-activated", r );
+	FileNotef( "vdb: port %s (mtp 0x%x, usb state 0x%x): 0x%08x (uptime %u s, failures %u)", bSystemTook ? "retaken" : "re-activated", mtp, st, r, Uptime(), s_nRetakeFailures );
+}
+
+void UsbRetakeReset( void )
+{
+	s_nRetakeFailures = 0;
+}
+
+// Three lines for the status overlay (60 columns each)
+void UsbStatusLines( char *pBuf, unsigned nSize )
+{
+	unsigned st = (unsigned)ksceUdcdGetDeviceState();
+	int mtp = ksceUdcdGetDrvState( "USB_MTP_Driver" );
+	snprintf( pBuf, nSize,
+		"usb 0x%04x ctrl %s act %s cable %s conn %s mtp 0x%x\n"
+		"bridge %s want %d host %s susp %s rx err 0x%08x\n"
+		"retakes %u fail %u last 0x%08x %s\n",
+		st, ( st & 0x2000 ) ? "up" : ( st & 0x1000 ) ? "down" : "?", ( st & SCE_UDCD_STATUS_ACTIVATED ) ? "y" : ( st & SCE_UDCD_STATUS_DEACTIVATED ) ? "n" : "?",
+		( st & SCE_UDCD_STATUS_CABLE_CONNECTED ) ? "in" : ( st & SCE_UDCD_STATUS_CABLE_DISCONNECTED ) ? "out" : "?",
+		( st & SCE_UDCD_STATUS_CONNECTION_ESTABLISHED ) ? "est" : ( st & SCE_UDCD_STATUS_CONNECTION_SUSPENDED ) ? "susp" : ( st & SCE_UDCD_STATUS_CONNECTION_NEW ) ? "new" : "?", (unsigned)mtp,
+		g_bActive ? "on" : "off", s_bWantPort, g_bHostAttached ? "attached" : "none", s_bSuspended ? "yes" : "no", s_nLastRecvError,
+		s_nRetakes, s_nRetakeFailures, s_nLastRetakeResult, s_SuspendNotes );
 }

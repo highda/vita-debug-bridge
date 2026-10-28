@@ -38,6 +38,7 @@
   vdb.py autopsy [--elf f] [--all] pull the newest core dump and run vita-parse-core on it
   vdb.py unlock                    peel the lock screen (a swipe from the top right corner)
   vdb.py osd "text" | off          text drawn over every frame (lines split at \\n, 6 x 60)
+  vdb.py osd status                the plugin's status overlay (USB state, bridge, battery; hotkey L+R+Start+Up)
   vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
                                    buttons: up down left right cross circle square triangle
                                    l r start select ps; sticks: --lx 255 --ly 0 --rx 128 --ry 128
@@ -711,12 +712,12 @@ def main():
         check(status, "kprintf")
         print(f"kernel printf capture {rest[0]}")
     elif cmd == "osd" and len(rest) == 1:
-        text = "" if rest[0] == "off" else rest[0].replace("\\n", "\n")
+        text = "" if rest[0] == "off" else "@status" if rest[0] == "status" else rest[0].replace("\\n", "\n")
         status, _ = b.simple(CMD_OSD, text.encode("utf-8", "replace") + b"\0")
         if status == -6:
             sys.exit("osd: the plugin's display hook is not installed")
         check(status, "osd")
-        print("osd off" if not text else f"osd: {len(text.splitlines())} line(s)")
+        print("osd off" if not text else "status overlay on (also: hotkey L+R+Start+Up)" if text == "@status" else f"osd: {len(text.splitlines())} line(s)")
     elif cmd == "unlock":
         cmd_touch(b, 930, 60, 200, 500, 600, "unlock swipe")
     elif cmd in ("reboot", "poweroff", "suspend") and len(rest) <= 1:

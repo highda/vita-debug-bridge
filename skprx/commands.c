@@ -518,7 +518,11 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 			SendReply( VDB_CMD_OSD, -6, 0 );
 			break;
 		}
-		OsdSet( pszPath );
+		// "@status" turns the status overlay on (the hotkey L+R+Start+Up
+		// does the same); any other text replaces it, empty turns all off
+		g_bStatusOsd = strcmp( pszPath, "@status" ) == 0;
+		if ( !g_bStatusOsd )
+			OsdSet( pszPath );
 		SendReply( VDB_CMD_OSD, 0, 0 );
 		break;
 	case VDB_CMD_PEEK:
