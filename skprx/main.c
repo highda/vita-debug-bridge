@@ -35,10 +35,11 @@
 #include <taihen.h>
 #include <stdarg.h>
 #include "usb_descriptors.h"
+#include "font8x8.h"
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.3.10"
+#define VDB_VERSION		"0.4.1"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -88,6 +89,7 @@ enum
 	VDB_CMD_KILL		= 15,	// arg: pid (0 = the process that owns the screen); reply payload: 4-byte pid
 	VDB_CMD_SCREEN		= 16,	// reply: VdbScreenHdr_t, then the raw framebuffer in frames, then an empty frame
 	VDB_CMD_TOUCH		= 18,	// payload: VdbTouch_t; a finger from (x0,y0) to (x1,y1) over ms milliseconds (screen pixels, 960x544)
+	VDB_CMD_OSD			= 19,	// payload: text, lines split at \n (empty: off); drawn on every frame the app shows
 	VDB_CMD_INPUT		= 17,	// payload: VdbInput_t; held for hold_ms, then released
 	VDB_CMD_POWER		= 13,	// arg: 0 cold reboot, 1 soft reboot, 2 power off, 3 suspend; replies, then acts 300 ms later
 };
@@ -490,6 +492,99 @@ static void CmdPutClose( void )
 }
 
 //-----------------------------------------------------------------------------
+// On-screen display: text drawn into every framebuffer the app presents,
+// through a hook on the display driver's SetFrameBuf (PSVshell's method).
+// The hook runs in the presenting process, so the rows go in with
+// ksceKernelMemcpyKernelToUser
+//-----------------------------------------------------------------------------
+#define OSD_LINES		6
+#define OSD_COLS		60
+#define OSD_SCALE		2
+#define OSD_X			8
+#define OSD_Y			8
+static char s_OsdText[OSD_LINES][OSD_COLS + 1];
+static volatile int s_nOsdLines;
+static unsigned s_OsdRow[OSD_COLS * 8 * OSD_SCALE] __attribute__(( aligned( 64 ) ));
+static tai_hook_ref_t s_DisplayRef;
+static SceUID s_DisplayHook = -1;
+
+// text -> lines; an empty text switches the display off
+static void OsdSet( const char *pszText )
+{
+	int nLines = 0, nCol = 0;
+	s_nOsdLines = 0;
+	memset( s_OsdText, 0, sizeof( s_OsdText ) );
+	for ( const char *p = pszText; *p && nLines < OSD_LINES; p++ )
+	{
+		if ( *p == '\n' )
+		{
+			nLines++;
+			nCol = 0;
+			continue;
+		}
+		if ( nCol < OSD_COLS )
+			s_OsdText[nLines][nCol++] = ( *p >= 32 && *p < 127 ) ? *p : '?';
+	}
+	if ( nCol )
+		nLines++;
+	s_nOsdLines = nLines;
+}
+
+static void OsdDraw( const SceDisplayFrameBuf *pFb )
+{
+	if ( !pFb || !pFb->base || pFb->pixelformat != 0 || pFb->width < 64 || pFb->pitch < pFb->width )
+		return;
+	const unsigned nFg = 0xFFFFFFFF, nBg = 0xFF000000;
+	unsigned y = OSD_Y;
+	for ( int l = 0; l < s_nOsdLines; l++ )
+	{
+		int nLen = strlen( s_OsdText[l] );
+		if ( !nLen )
+		{
+			y += 8 * OSD_SCALE;
+			continue;
+		}
+		unsigned nWidth = nLen * 8 * OSD_SCALE;
+		if ( OSD_X + nWidth > pFb->width )
+			nWidth = pFb->width - OSD_X;
+		for ( int r = 0; r < 8; r++ )
+		{
+			// one glyph row of the line, scaled
+			for ( int c = 0; c < nLen; c++ )
+			{
+				unsigned char bits = s_Font8x8[s_OsdText[l][c] - 32][r];
+				for ( int b = 0; b < 8; b++ )
+				{
+					unsigned px = ( bits >> b ) & 1 ? nFg : nBg;
+					for ( int sx = 0; sx < OSD_SCALE; sx++ )
+						s_OsdRow[( c * 8 + b ) * OSD_SCALE + sx] = px;
+				}
+			}
+			for ( int sy = 0; sy < OSD_SCALE; sy++, y++ )
+			{
+				if ( y >= pFb->height )
+					return;
+				ksceKernelMemcpyKernelToUser( (unsigned char *)pFb->base + ( y * pFb->pitch + OSD_X ) * 4, s_OsdRow, nWidth * 4 );
+			}
+		}
+	}
+}
+
+static int Hook_ksceDisplaySetFrameBufInternal( int head, int index, const SceDisplayFrameBuf *pParam, int sync )
+{
+	// Every presented frame of the main head, whatever its index. (0.4.0
+	// asked ksceAppMgrIsExclusiveProcessRunning with a NULL title id here
+	// to spare the shell's overlays, as PSVshell does with an older header;
+	// the first index-1 frame, the game's, dereferenced that NULL and
+	// powered the Vita off.) The copy routine validates the destination
+	// itself, so an unexpected framebuffer costs nothing more than a
+	// skipped row
+	if ( head && pParam && s_nOsdLines )
+		OsdDraw( pParam );
+	return TAI_CONTINUE( int, s_DisplayRef, head, index, pParam, sync );
+}
+
+//-----------------------------------------------------------------------------
 // Touch injection hooks
 //-----------------------------------------------------------------------------
 static tai_hook_ref_t s_TouchRef[4];
@@ -563,8 +658,18 @@ static void InstallTouchHooks( void )
 	}
 }
 
+static void InstallDisplayHook( void )
+{
+	s_DisplayHook = taiHookFunctionExportForKernel( KERNEL_PID, &s_DisplayRef, "SceDisplay", 0x9FED47AC, 0x16466675, Hook_ksceDisplaySetFrameBufInternal );
+	char note[64];
+	snprintf( note, sizeof( note ), "vdb: display hook: 0x%08x\n", (unsigned)s_DisplayHook );
+	FileNote( note );
+}
+
 static void RemoveTouchHooks( void )
 {
+	if ( s_DisplayHook >= 0 )
+		taiHookReleaseForKernel( s_DisplayHook, s_DisplayRef );
 	for ( int i = 0; i < 4; i++ )
 		if ( s_TouchHook[i] >= 0 )
 			taiHookReleaseForKernel( s_TouchHook[i], s_TouchRef[i] );
@@ -826,6 +931,15 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 		s_nTouchStart = ksceKernelGetSystemTimeWide();
 		s_nTouchUntil = s_nTouchStart + (unsigned long long)s_Touch.ms * 1000;
 		SendReply( VDB_CMD_TOUCH, 0, 0 );
+		break;
+	case VDB_CMD_OSD:
+		if ( s_DisplayHook < 0 )
+		{
+			SendReply( VDB_CMD_OSD, -6, 0 );
+			break;
+		}
+		OsdSet( pszPath );
+		SendReply( VDB_CMD_OSD, 0, 0 );
 		break;
 	case VDB_CMD_INPUT:
 		if ( nPayload < sizeof( VdbInput_t ) )
@@ -1138,6 +1252,21 @@ int vdb_shell_poll( char *pUserOut, unsigned nSize )
 	return (int)n;
 }
 
+// Apps: text for the on-screen display (lines split at \n, empty = off)
+int vdb_osd( const char *pUser, unsigned nLen )
+{
+	char buf[OSD_LINES * ( OSD_COLS + 1 ) + 1];
+	if ( s_DisplayHook < 0 )
+		return -6;
+	if ( nLen >= sizeof( buf ) )
+		nLen = sizeof( buf ) - 1;
+	if ( nLen && ksceKernelMemcpyFromUser( buf, pUser, nLen ) < 0 )
+		return -1;
+	buf[nLen] = 0;
+	OsdSet( buf );
+	return 0;
+}
+
 int vdb_shell_result( int nCode )
 {
 	Log( "vdb: shell companion: request done, result 0x%08x", nCode );
@@ -1248,6 +1377,7 @@ int module_start( SceSize argc, const void *args )
 	}
 	s_bRegistered = 1;
 	InstallTouchHooks();
+	InstallDisplayHook();
 	{
 		SceKernelAllocMemBlockKernelOpt opt;
 		memset( &opt, 0, sizeof( opt ) );

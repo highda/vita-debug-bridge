@@ -10,8 +10,8 @@ RANLIB = $(ARCH)-ranlib
 TARGETS = libVDB_365_stub.a
 TARGETS_WEAK = libVDB_365_stub_weak.a
 
-VDB_365_OBJS = VDB_VdbForUser_vdb_write_365.o VDB_VdbForUser_vdb_usb_start_365.o VDB_VdbForUser_vdb_usb_stop_365.o VDB_VdbForUser_vdb_shell_poll_365.o VDB_VdbForUser_vdb_shell_result_365.o
-VDB_365_weak_OBJS = VDB_VdbForUser_vdb_write_365.wo VDB_VdbForUser_vdb_usb_start_365.wo VDB_VdbForUser_vdb_usb_stop_365.wo VDB_VdbForUser_vdb_shell_poll_365.wo VDB_VdbForUser_vdb_shell_result_365.wo
+VDB_365_OBJS = VDB_VdbForUser_vdb_write_365.o VDB_VdbForUser_vdb_usb_start_365.o VDB_VdbForUser_vdb_usb_stop_365.o VDB_VdbForUser_vdb_shell_poll_365.o VDB_VdbForUser_vdb_shell_result_365.o VDB_VdbForUser_vdb_osd_365.o
+VDB_365_weak_OBJS = VDB_VdbForUser_vdb_write_365.wo VDB_VdbForUser_vdb_usb_start_365.wo VDB_VdbForUser_vdb_usb_stop_365.wo VDB_VdbForUser_vdb_shell_poll_365.wo VDB_VdbForUser_vdb_shell_result_365.wo VDB_VdbForUser_vdb_osd_365.wo
 SceKernel_OBJS =
 ALL_OBJS=
 

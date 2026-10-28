@@ -17,3 +17,4 @@ VDB:
         - vdb_usb_stop: 0xB62CD7BF
         - vdb_shell_poll: 0x3A1F6C02
         - vdb_shell_result: 0x7D90E5B4
+        - vdb_osd: 0x51C3A9E7

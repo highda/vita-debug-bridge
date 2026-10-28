@@ -19,6 +19,8 @@ int vdb_usb_stop( void );
 // returns its length including the NUL, 0 when none; report the result
 int vdb_shell_poll( char *pOut, unsigned nSize );
 int vdb_shell_result( int nCode );
+// Text for the on-screen display drawn over the app's frames (lines split at \n, empty text = off, up to 6 lines of 60)
+int vdb_osd( const char *pText, unsigned nLen );
 
 #ifdef __cplusplus
 }

@@ -23,6 +23,7 @@
   vdb.py touch X Y [--hold 100]    a finger on the front panel (screen pixels, 960x544)
   vdb.py swipe X0 Y0 X1 Y1 [--ms 400]
   vdb.py unlock                    peel the lock screen (a swipe from the top right corner)
+  vdb.py osd "text" | off          text drawn over every frame (lines split at \\n, 6 x 60)
   vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
                                    buttons: up down left right cross circle square triangle
                                    l r start select ps; sticks: --lx 255 --ly 0 --rx 128 --ry 128
@@ -53,7 +54,7 @@ RSP = struct.Struct("<IIiI")
 
 (CMD_PING, CMD_STATUS, CMD_LIST, CMD_STAT, CMD_GET, CMD_PUT_OPEN, CMD_PUT_DATA,
  CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME, CMD_POWER,
- CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT, CMD_TOUCH) = range(1, 19)
+ CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT, CMD_TOUCH, CMD_OSD) = range(1, 20)
 BUTTONS = {"select": 0x1, "l3": 0x2, "r3": 0x4, "start": 0x8, "up": 0x10, "right": 0x20, "down": 0x40,
            "left": 0x80, "l": 0x100, "r": 0x200, "l1": 0x400, "r1": 0x800, "triangle": 0x1000,
            "circle": 0x2000, "cross": 0x4000, "square": 0x8000, "ps": 0x10000}
@@ -432,6 +433,13 @@ def main():
     elif cmd == "swipe" and len(rest) >= 4:
         ms = opt_int(rest, "--ms", 400)
         cmd_touch(b, *(int(v) for v in rest[:4]), ms, "swipe")
+    elif cmd == "osd" and len(rest) == 1:
+        text = "" if rest[0] == "off" else rest[0].replace("\\n", "\n")
+        status, _ = b.simple(CMD_OSD, text.encode("utf-8", "replace") + b"\0")
+        if status == -6:
+            sys.exit("osd: the plugin's display hook is not installed")
+        check(status, "osd")
+        print("osd off" if not text else f"osd: {len(text.splitlines())} line(s)")
     elif cmd == "unlock":
         cmd_touch(b, 930, 60, 200, 500, 600, "unlock swipe")
     elif cmd in ("reboot", "poweroff", "suspend") and len(rest) <= 1:
