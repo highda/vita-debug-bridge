@@ -100,6 +100,7 @@ typedef struct
 	SceUID thid;
 	char name[32];
 	unsigned nSamples, nRunning, nOverflow;
+	unsigned long long nRunUs0, nRunUs1;	// the kernel's run clock at the first and the last sample: the real CPU time
 	ProfBucket_t buckets[PROF_BUCKETS];
 } ProfThread_t;
 
@@ -108,6 +109,7 @@ static int s_nProfThreads;
 static SceUID s_ProfPid = -1, s_ProfThread = -1;
 static volatile int s_bProfRun;
 static unsigned s_nProfInterval = 1000, s_nProfRounds;
+static unsigned long long s_nProfStartUs, s_nProfEndUs;
 
 static ProfThread_t *ProfSlot( SceUID thid )
 {
@@ -123,7 +125,10 @@ static ProfThread_t *ProfSlot( SceUID thid )
 	memset( &info, 0, sizeof( info ) );
 	info.size = sizeof( info );
 	if ( ksceKernelGetThreadInfo( thid, &info ) >= 0 )
+	{
 		snprintf( p->name, sizeof( p->name ), "%s", info.name );
+		p->nRunUs0 = p->nRunUs1 = info.runClocks;
+	}
 	return p;
 }
 
@@ -180,7 +185,10 @@ static int ProfSampler( SceSize args, void *argp )
 			// running, or ready: the sampler itself runs at a high priority
 			// and preempts the thread it is about to look at, which then
 			// reads as ready though it wanted the core
-			int bRunning = ksceKernelGetThreadInfo( ids[i], &info ) >= 0 && ( info.status & ( SCE_THREAD_RUNNING | SCE_THREAD_READY ) );
+			int bInfo = ksceKernelGetThreadInfo( ids[i], &info ) >= 0;
+			int bRunning = bInfo && ( info.status & ( SCE_THREAD_RUNNING | SCE_THREAD_READY ) );
+			if ( bInfo )
+				p->nRunUs1 = info.runClocks;
 			// the registers can be read from a debug-suspended thread only:
 			// suspend, read, resume, a few microseconds per thread. The
 			// status word's meaning is undocumented; the first accepted one
@@ -292,6 +300,7 @@ static int ProfSampler( SceSize args, void *argp )
 		}
 		nRound++;
 		s_nProfRounds = nRound;
+		s_nProfEndUs = ksceKernelGetSystemTimeWide();
 	}
 	return 0;
 }
@@ -323,6 +332,7 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		s_nProfInterval = us < 200 ? 200 : us > 100000 ? 100000 : us;
 		s_nProfThreads = 0;
 		s_nProfRounds = 0;
+		s_nProfStartUs = s_nProfEndUs = ksceKernelGetSystemTimeWide();
 		s_bProfRun = 1;
 		s_ProfThread = ksceKernelCreateThread( "vdb_prof", ProfSampler, 0x20, 0x2000, 0, 0x10000, 0 );
 		if ( s_ProfThread < 0 || ksceKernelStartThread( s_ProfThread, 0, NULL ) < 0 )
@@ -342,14 +352,17 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		SendReply( VDB_CMD_PROFILE, 0, 4 );
 		return;
 	}
-	// dump: "R rounds interval pid", then per thread "T thid samples running overflow name" and "S pc lr count" lines
+	// dump: "R rounds interval pid elapsed_us", then per thread "T thid samples running overflow cpu_us name" and "S pc lr ra ra2 count" lines.
+	// cpu_us is the kernel's run clock over the window: the CPU time itself.
+	// "running" counts samples in RUNNING or READY, which overstates a thread
+	// that wakes often (it is caught ready, waiting for its core)
 	unsigned nUsed = 0;
-	if ( Emit( VDB_CMD_PROFILE, &nUsed, "R %u %u 0x%08x\n", s_nProfRounds, s_nProfInterval, (unsigned)s_ProfPid ) < 0 )
+	if ( Emit( VDB_CMD_PROFILE, &nUsed, "R %u %u 0x%08x %u\n", s_nProfRounds, s_nProfInterval, (unsigned)s_ProfPid, (unsigned)( s_nProfEndUs - s_nProfStartUs ) ) < 0 )
 		return;
 	for ( int t = 0; t < s_nProfThreads; t++ )
 	{
 		ProfThread_t *p = &s_Prof[t];
-		if ( Emit( VDB_CMD_PROFILE, &nUsed, "T 0x%08x %u %u %u %s\n", (unsigned)p->thid, p->nSamples, p->nRunning, p->nOverflow, p->name ) < 0 )
+		if ( Emit( VDB_CMD_PROFILE, &nUsed, "T 0x%08x %u %u %u %u %s\n", (unsigned)p->thid, p->nSamples, p->nRunning, p->nOverflow, (unsigned)( p->nRunUs1 - p->nRunUs0 ), p->name ) < 0 )
 			return;
 		for ( int b = 0; b < PROF_BUCKETS; b++ )
 			if ( p->buckets[b].count && Emit( VDB_CMD_PROFILE, &nUsed, "S %x %x %x %x %u\n", p->buckets[b].pc, p->buckets[b].lr, p->buckets[b].ra, p->buckets[b].ra2, p->buckets[b].count ) < 0 )

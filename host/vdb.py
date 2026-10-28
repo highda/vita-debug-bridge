@@ -510,14 +510,21 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
         open(raw_out, "w").write(text)
     mm = ModuleMap(b, build_dir)
     threads, cur = [], None
-    rounds = 0
+    rounds, elapsed_us = 0, 0
     for line in text.splitlines():
         kind, rest = line[0], line[2:]
         if kind == "R":
-            rounds = int(rest.split()[0])
+            rparts = rest.split()
+            rounds = int(rparts[0])
+            elapsed_us = int(rparts[3]) if len(rparts) > 3 else 0
         elif kind == "T":
-            thid, samples, running, overflow, name = rest.split(" ", 4)
-            cur = {"thid": thid, "samples": int(samples), "running": int(running), "overflow": int(overflow), "name": name, "pcs": {}}
+            tparts = rest.split(" ", 5)
+            if len(tparts) == 6 and tparts[4].isdigit():  # 0.7.6+: cpu_us before the name
+                thid, samples, running, overflow, cpu_us, name = tparts
+            else:
+                thid, samples, running, overflow, name = rest.split(" ", 4)
+                cpu_us = -1
+            cur = {"thid": thid, "samples": int(samples), "running": int(running), "overflow": int(overflow), "cpu_us": int(cpu_us), "name": name, "pcs": {}}
             threads.append(cur)
         elif kind == "S" and cur is not None:
             parts = rest.split()
@@ -525,7 +532,7 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
             key = tuple((hexes + [0, 0, 0, 0])[:4])  # pc, lr, ra, ra2
             cur["pcs"][key] = cur["pcs"].get(key, 0) + count
     print(f"{rounds} rounds, {len(threads)} threads, modules known: {len(mm.mods)}")
-    threads.sort(key=lambda t: -t["running"])
+    threads.sort(key=lambda t: -(t["cpu_us"] if t["cpu_us"] >= 0 else t["running"]))
     cache = {}
 
     SYSTEM = ("SceLibKernel", "SceDriverUser", "SceLibc", "SceSysmem", "SceKernelThreadMgr")
@@ -569,7 +576,8 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
         pct_run = 100.0 * t["running"] / max(rounds, 1)
         if t["running"] == 0:
             continue
-        print(f"\n{t['name']} ({t['thid']}): on a core {pct_run:.0f}% of the time ({t['running']} of {t['samples']} samples), {t['overflow']} dropped")
+        cpu = f"cpu {100.0 * t['cpu_us'] / elapsed_us:.0f}% (kernel run clock), " if t["cpu_us"] >= 0 and elapsed_us else ""
+        print(f"\n{t['name']} ({t['thid']}): {cpu}running or ready in {pct_run:.0f}% of the samples ({t['running']} of {t['samples']}), {t['overflow']} dropped")
         # aggregate by function (or address when unresolved)
         agg = {}
         for (pc, lr, ra, ra2), count in t["pcs"].items():
