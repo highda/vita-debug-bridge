@@ -129,7 +129,9 @@ static ProfThread_t *ProfSlot( SceUID thid )
 
 static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr, unsigned ra )
 {
-	unsigned h = ( ( pc >> 1 ) ^ ( lr << 7 ) ^ ( ra << 13 ) ) * 2654435761u;
+	// keyed on pc and lr only: the stack address is kept from the first
+	// sample, keying on it as well overflowed the table on a flat profile
+	unsigned h = ( ( pc >> 1 ) ^ ( lr << 7 ) ) * 2654435761u;
 	for ( unsigned i = 0; i < 16; i++ )
 	{
 		ProfBucket_t *b = &p->buckets[( h + i ) & ( PROF_BUCKETS - 1 )];
@@ -141,8 +143,10 @@ static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr, unsigned ra )
 			b->count = 1;
 			return;
 		}
-		if ( b->pc == pc && b->lr == lr && b->ra == ra )
+		if ( b->pc == pc && b->lr == lr )
 		{
+			if ( !b->ra )
+				b->ra = ra;
 			b->count++;
 			return;
 		}
