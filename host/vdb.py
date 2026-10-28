@@ -96,7 +96,7 @@ class Bridge:
         _, status, data = self.reply()
         text = data.decode("utf-8", "replace")
         if status == 0 and ", rx " in text:
-            self.rx_size = int(text.rsplit(", rx ", 1)[1].split()[0])
+            self.rx_size = int(text.rsplit(", rx ", 1)[1].split()[0].rstrip(",;"))
         self.status_text = text
         self.put_chunk = self.rx_size - HDR.size
 

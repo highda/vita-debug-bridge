@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.4.1"
+#define VDB_VERSION		"0.4.3"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -869,8 +869,9 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 	case VDB_CMD_STATUS:
 	{
 		// "rx N" is read by the host to size its command frames
-		int n = snprintf( (char *)ReplyPayload(), s_nDataChunk, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u\n",
-			s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), (int)s_PutFd, (unsigned)RX_SIZE );
+		int n = snprintf( (char *)ReplyPayload(), s_nDataChunk, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% %s, usb state 0x%x\n",
+			s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), (int)s_PutFd, (unsigned)RX_SIZE,
+			kscePowerGetBatteryLifePercent(), kscePowerIsBatteryCharging() ? "charging" : "not charging", (unsigned)ksceUdcdGetDeviceState() );
 		SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 		break;
 	}
@@ -1131,7 +1132,14 @@ static int UsbThread( SceSize args, void *argp )
 			// system driver and take the port back if it came up
 			if ( s_bActive && nTicks % 5 == 0 )
 			{
+				// ours no longer activated, or the system's MTP device up:
+				// either way the port is not the bridge any more (an app
+				// launch, VitaShell's USB mode, Content Manager)
+				// (0.4.2 also required our own driver to report ACTIVATED;
+				// it never does, the port was retaken every second and the
+				// device never enumerated)
 				int mtp = ksceUdcdGetDrvState( "USB_MTP_Driver" );
+				int own = ksceUdcdGetDrvState( VDB_DRIVER_NAME );
 				if ( mtp & SCE_UDCD_STATUS_ACTIVATED )
 				{
 					s_bActive = 0;
@@ -1139,7 +1147,7 @@ static int UsbThread( SceSize args, void *argp )
 					bSending = 0;
 					PutAbort();
 					int r = vdb_usb_start();
-					Log( "vdb: the system took the USB port (mtp state 0x%x), retaken: 0x%08x", mtp, r );
+					Log( "vdb: the system took the USB port (mtp state 0x%x, ours 0x%x), retaken: 0x%08x", mtp, own, r );
 					char note[96];
 					snprintf( note, sizeof( note ), "vdb: port retaken after the system took it: 0x%08x (uptime %u s)\n", r,
 						(unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ) );
@@ -1333,6 +1341,10 @@ int vdb_usb_start( void )
 		return ret;
 	}
 	s_bActive = 1;
+	// the system's MTP driver asks ScePower for USB charging when it is
+	// up; with ours in its place nobody did, and a night on the bridge
+	// drained the battery from 92 to 24 percent
+	kscePowerBatteryEnableUsbCharging();
 	Log( "vdb: usb device active (pid 0x%04x)", VDB_USB_PID );
 	return 0;
 }

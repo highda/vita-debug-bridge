@@ -135,8 +135,8 @@ static SceUdcdConfigDescriptor confdesc_hi = {
 	2,							// bNumInterfaces
 	1,							// bConfigurationValue
 	0,							// iConfiguration
-	0xC0,						// bmAttributes: self powered
-	0,							// bMaxPower
+	0x80,						// bmAttributes: bus powered (self powered with 0 mA, as before, left the Vita uncharged all night)
+	0xFA,						// bMaxPower: 500 mA
 	&settings_hi[0]
 };
 
