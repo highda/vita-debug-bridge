@@ -20,8 +20,9 @@
   vdb.py launch ABCD12345          start an installed app through the shell (needs vdb_shell.suprx)
   vdb.py kill [pid]                kill a process (default: the one that owns the screen; never the shell)
   vdb.py screen [out.png]          grab the screen (default: screen-<time>.png)
-  vdb.py touch X Y [--hold 100]    a finger on the front panel (screen pixels, 960x544)
-  vdb.py swipe X0 Y0 X1 Y1 [--ms 400]
+  vdb.py touch X Y [--hold 100] [--back]   a finger on the front (or rear) panel, screen pixels 960x544
+  vdb.py swipe X0 Y0 X1 Y1 [--ms 400] [--back]
+  vdb.py kprintf on|off            mirror the kernel's own printf output into the log stream
   vdb.py unlock                    peel the lock screen (a swipe from the top right corner)
   vdb.py osd "text" | off          text drawn over every frame (lines split at \\n, 6 x 60)
   vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
@@ -54,7 +55,7 @@ RSP = struct.Struct("<IIiI")
 
 (CMD_PING, CMD_STATUS, CMD_LIST, CMD_STAT, CMD_GET, CMD_PUT_OPEN, CMD_PUT_DATA,
  CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME, CMD_POWER,
- CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT, CMD_TOUCH, CMD_OSD) = range(1, 20)
+ CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT, CMD_TOUCH, CMD_OSD, CMD_KPRINTF) = range(1, 21)
 BUTTONS = {"select": 0x1, "l3": 0x2, "r3": 0x4, "start": 0x8, "up": 0x10, "right": 0x20, "down": 0x40,
            "left": 0x80, "l": 0x100, "r": 0x200, "l1": 0x400, "r1": 0x800, "triangle": 0x1000,
            "circle": 0x2000, "cross": 0x4000, "square": 0x8000, "ps": 0x10000}
@@ -337,8 +338,8 @@ def cmd_input(b, args):
     print(f"input: buttons 0x{buttons:x}, sticks {sticks}, held {hold} ms")
 
 
-def cmd_touch(b, x0, y0, x1, y1, ms, what):
-    payload = struct.pack("<4HI", x0, y0, x1, y1, ms)
+def cmd_touch(b, x0, y0, x1, y1, ms, what, back=False):
+    payload = struct.pack("<4HII", x0, y0, x1, y1, ms, 1 if back else 0)
     status, _ = b.simple(CMD_TOUCH, payload)
     if status == -6:
         sys.exit("touch: the plugin's touch hooks are not installed (taiHEN missing?)")
@@ -427,12 +428,19 @@ def main():
     elif cmd == "input" and rest:
         cmd_input(b, rest)
     elif cmd == "touch" and len(rest) >= 2:
+        back = "--back" in rest and (rest.remove("--back") or True)
         hold = opt_int(rest, "--hold", 100)
         x, y = int(rest[0]), int(rest[1])
-        cmd_touch(b, x, y, x, y, hold, "touch")
+        cmd_touch(b, x, y, x, y, hold, "rear touch" if back else "touch", back)
     elif cmd == "swipe" and len(rest) >= 4:
+        back = "--back" in rest and (rest.remove("--back") or True)
         ms = opt_int(rest, "--ms", 400)
-        cmd_touch(b, *(int(v) for v in rest[:4]), ms, "swipe")
+        cmd_touch(b, *(int(v) for v in rest[:4]), ms, "rear swipe" if back else "swipe", back)
+    elif cmd == "kprintf" and len(rest) == 1 and rest[0] in ("on", "off"):
+        b.send(CMD_KPRINTF, arg=1 if rest[0] == "on" else 0)
+        _, status, _ = b.reply()
+        check(status, "kprintf")
+        print(f"kernel printf capture {rest[0]}")
     elif cmd == "osd" and len(rest) == 1:
         text = "" if rest[0] == "off" else rest[0].replace("\\n", "\n")
         status, _ = b.simple(CMD_OSD, text.encode("utf-8", "replace") + b"\0")
