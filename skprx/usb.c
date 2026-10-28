@@ -78,10 +78,13 @@ static int QueueReceive( int idx )
 	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
 	SceUdcdDeviceRequest *pReq = &s_RxReq[idx];
 	int r = -1;
-	for ( int nTry = 0; nTry < 5 && r < 0; nTry++ )
+	// right after an attach the cancel of the previous request can still
+	// be in flight and the endpoint answers busy (0x80243007): wait it out,
+	// up to about 100 ms
+	for ( int nTry = 0; nTry < 50 && r < 0; nTry++ )
 	{
 		if ( nTry )
-			ksceKernelDelayThread( 200 );
+			ksceKernelDelayThread( 2000 );
 		memset( pReq, 0, sizeof( *pReq ) );
 		pReq->endpoint = &endpoints[VDB_EP_OUT];
 		pReq->data = s_pRxBuf[idx];
@@ -93,8 +96,11 @@ static int QueueReceive( int idx )
 		if ( r < 0 )
 		{
 			s_bRxOutstanding = 0;
-			FileNotef( "vdb: ReqRecv(%d) failed 0x%08x (try %d)", idx, r, nTry + 1 );
+			if ( nTry == 0 || nTry == 49 )
+				FileNotef( "vdb: ReqRecv(%d) failed 0x%08x (try %d)", idx, r, nTry + 1 );
 		}
+		else if ( nTry )
+			FileNotef( "vdb: ReqRecv(%d) ok after %d tries", idx, nTry + 1 );
 	}
 	return r;
 }
@@ -113,7 +119,7 @@ int UsbTakeFrame( unsigned char **ppFrame )
 	// the one outstanding request finished into buffer idx: take its
 	// length, queue the other buffer, hand idx out while USB fills the other
 	int idx = s_nRxQueuedIdx;
-	int nLen = s_RxReq[idx].transmitted;
+	int nLen = s_RxReq[idx].returnCode < 0 ? 0 : s_RxReq[idx].transmitted;
 	s_nRxProcessed = s_nRxCompleted;
 	QueueReceive( ( idx + 1 ) % s_nRxBufs );
 	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
@@ -125,9 +131,12 @@ int UsbTakeFrame( unsigned char **ppFrame )
 // outstanding, or the host's next command times out
 void UsbWatchdog( void )
 {
-	if ( g_bHostAttached && g_bActive && !s_bRxOutstanding && s_nRxProcessed == s_nRxCompleted )
+	// (a completion of a cancelled, older request may have bumped the
+	// counters: what matters is only that nothing is outstanding now)
+	if ( g_bHostAttached && g_bActive && !s_bRxOutstanding )
 	{
 		FileNotef( "vdb: no receive outstanding, queued again (uptime %u s)", Uptime() );
+		s_nRxProcessed = s_nRxCompleted;
 		QueueReceive( ( s_nRxQueuedIdx + 1 ) % s_nRxBufs );
 	}
 }

@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.6.9"
+#define VDB_VERSION		"0.6.10"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_NOTE_FILE	VDB_DIR "boot.txt"

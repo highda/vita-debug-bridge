@@ -82,11 +82,17 @@ def open_device(interface):
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if dev is None:
         sys.exit("no vdb device (Vita not connected, plugin idle, or usb_on flag missing)")
+    # after a re-enumeration (the Vita retakes the port after an app launch)
+    # the device can sit unconfigured, and every bulk write then fails with an
+    # I/O error: make sure configuration 1 is selected
     try:
-        dev.get_active_configuration()
+        cfg = dev.get_active_configuration()
+        configured = cfg is not None and cfg.bConfigurationValue == 1
     except usb.core.USBError:
+        configured = False
+    if not configured:
         try:
-            dev.set_configuration()
+            dev.set_configuration(1)
         except usb.core.USBError as e:
             print(f"set_configuration: {e}", file=sys.stderr)
     usb.util.claim_interface(dev, interface)
