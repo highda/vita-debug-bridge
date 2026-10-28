@@ -220,6 +220,75 @@ static SceUID ScreenOwner( SceDisplayFrameBufInfo *pInfo )
 	return pInfo->pid;
 }
 
+SceUID ScreenOwnerPid( void )
+{
+	SceDisplayFrameBufInfo info;
+	return ScreenOwner( &info );
+}
+
+// PEEK: a process's memory, streamed like a file
+static void CmdPeek( SceUID pid, const unsigned char *pPayload, unsigned nPayload )
+{
+	if ( nPayload < 8 )
+	{
+		SendReply( VDB_CMD_PEEK, -2, 0 );
+		return;
+	}
+	unsigned nAddr, nLen;
+	memcpy( &nAddr, pPayload, 4 );
+	memcpy( &nLen, pPayload + 4, 4 );
+	if ( pid == 0 )
+		pid = ScreenOwnerPid();
+	if ( pid < 0 || nLen > 64 * 1024 * 1024 )
+	{
+		SendReply( VDB_CMD_PEEK, pid < 0 ? pid : -2, 0 );
+		return;
+	}
+	unsigned nDone = 0;
+	int nErr = 0;
+	while ( nDone < nLen )
+	{
+		unsigned n = nLen - nDone;
+		if ( n > ReplyCapacity() )
+			n = ReplyCapacity();
+		int r = ksceKernelCopyFromUserProc( pid, ReplyPayload(), (const void *)( nAddr + nDone ), n );
+		if ( r < 0 )
+		{
+			nErr = r;
+			break;
+		}
+		if ( SendReply( VDB_CMD_PEEK, 0, n ) < 0 )
+			return;
+		nDone += n;
+	}
+	SendReply( VDB_CMD_PEEK, nErr, 0 );
+}
+
+// POKE: bytes into a process's memory
+static void CmdPoke( SceUID pid, const unsigned char *pPayload, unsigned nPayload )
+{
+	if ( nPayload < 5 )
+	{
+		SendReply( VDB_CMD_POKE, -2, 0 );
+		return;
+	}
+	unsigned nAddr;
+	memcpy( &nAddr, pPayload, 4 );
+	if ( pid == 0 )
+		pid = ScreenOwnerPid();
+	if ( pid < 0 )
+	{
+		SendReply( VDB_CMD_POKE, pid, 0 );
+		return;
+	}
+	unsigned nLen = nPayload - 4;
+	int r = ksceKernelCopyToUserProc( pid, (void *)nAddr, pPayload + 4, nLen );
+	unsigned nWritten = r < 0 ? 0 : nLen;
+	Log( "vdb: poke pid 0x%08x addr 0x%08x %u bytes: 0x%08x", pid, nAddr, nLen, r );
+	memcpy( ReplyPayload(), &nWritten, 4 );
+	SendReply( VDB_CMD_POKE, r < 0 ? r : 0, 4 );
+}
+
 static void CmdKill( int pid )
 {
 	SceDisplayFrameBufInfo info;
@@ -440,6 +509,18 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 		}
 		OsdSet( pszPath );
 		SendReply( VDB_CMD_OSD, 0, 0 );
+		break;
+	case VDB_CMD_PEEK:
+		CmdPeek( (SceUID)hdr.arg, pPayload, nPayload );
+		break;
+	case VDB_CMD_POKE:
+		CmdPoke( (SceUID)hdr.arg, pPayload, nPayload );
+		break;
+	case VDB_CMD_PROCINFO:
+		CmdProcInfo( hdr.arg ? (SceUID)hdr.arg : ScreenOwnerPid() );
+		break;
+	case VDB_CMD_PROFILE:
+		CmdProfile( hdr.arg, pPayload, nPayload );
 		break;
 	case VDB_CMD_KPRINTF:
 		KprintfCapture( hdr.arg != 0 );

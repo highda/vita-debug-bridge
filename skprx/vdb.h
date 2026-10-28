@@ -17,6 +17,7 @@
 
 #include <psp2kern/kernel/modulemgr.h>
 #include <psp2kern/kernel/threadmgr.h>
+#include <psp2kern/kernel/threadmgr/debugger.h>
 #include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/sysclib.h>
 #include <psp2kern/kernel/cpu.h>
@@ -38,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.5.2"
+#define VDB_VERSION		"0.6.8"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_NOTE_FILE	VDB_DIR "boot.txt"
@@ -98,6 +99,10 @@ enum
 	VDB_CMD_TOUCH		= 18,	// payload: VdbTouch_t; a finger from (x0,y0) to (x1,y1) over ms milliseconds (screen pixels, 960x544)
 	VDB_CMD_OSD			= 19,	// payload: text, lines split at \n (empty: off); drawn on every frame the app shows
 	VDB_CMD_KPRINTF		= 20,	// arg: 1 mirrors the kernel's printf output into the log ring, 0 stops
+	VDB_CMD_PEEK		= 21,	// arg: pid (0 = the process on screen); payload: u32 addr, u32 len; reply: data frames, then an empty frame
+	VDB_CMD_POKE		= 22,	// arg: pid; payload: u32 addr, then the bytes; reply: status, payload u32 bytes written
+	VDB_CMD_PROCINFO	= 23,	// arg: pid; reply: text lines (process, threads, modules), then an empty frame
+	VDB_CMD_PROFILE		= 24,	// arg: 1 start (payload: u32 pid, u32 interval us), 0 stop, 2 dump (text lines, then an empty frame)
 };
 
 typedef struct
@@ -181,6 +186,14 @@ void InputTick( void );				// from the thread loop every 200 ms
 void InputRelease( void );
 int TouchAvailable( void );
 void TouchSet( const VdbTouch_t *pTouch, unsigned nPayload );
+
+//-----------------------------------------------------------------------------
+// profile.c: a sampling profiler (thread program counters) and process info
+//-----------------------------------------------------------------------------
+SceUID ScreenOwnerPid( void );			// the process whose framebuffer is on screen
+void CmdProcInfo( SceUID pid );
+void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayload );
+void ProfileStop( void );
 
 //-----------------------------------------------------------------------------
 // osd.c: on-screen display

@@ -202,6 +202,7 @@ static int Attach( int usb_version, void *user_data )
 	// the host configured us
 	kscePowerBatterySetUsbStatus( SCE_POWER_BATTERY_USB_STATUS_CONFIGURED );
 	kscePowerBatteryEnableUsbCharging();
+	kscePowerBatteryPermitCharging();	// in case the system's USB teardown left a forbid count behind
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_IN] );
 	ksceUdcdClearFIFO( &endpoints[VDB_EP_IN] );
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_OUT] );

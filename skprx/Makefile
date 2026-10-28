@@ -1,8 +1,8 @@
 TARGET	= vdb
-OBJS	= main.o usb.o commands.o log.o input.o osd.o
+OBJS	= main.o usb.o commands.o log.o input.o osd.o profile.o
 LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
-	-lSceIofilemgrForDriver_stub -lSceSysclibForDriver_stub -lSceCtrlForDriver_stub -lScePowerForDriver_stub -lSceKernelSuspendForDriver_stub -lSceAppMgrForDriver_stub -lSceDisplayForDriver_stub -lSceSysrootForDriver_stub -ltaihenForKernel_stub -lSceDebugForKernel_363_stub -lSceDebugForDriver_stub
+	-lSceIofilemgrForDriver_stub -lSceSysclibForDriver_stub -lSceCtrlForDriver_stub -lScePowerForDriver_stub -lSceKernelSuspendForDriver_stub -lSceAppMgrForDriver_stub -lSceDisplayForDriver_stub -lSceSysrootForDriver_stub -ltaihenForKernel_stub -lSceDebugForKernel_363_stub -lSceDebugForDriver_stub -lSceModulemgrForKernel_363_stub -lSceSysrootForKernel_stub
 
 PREFIX	= arm-vita-eabi
 CC	= $(PREFIX)-gcc

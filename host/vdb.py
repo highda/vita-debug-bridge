@@ -23,6 +23,14 @@
   vdb.py touch X Y [--hold 100] [--back]   a finger on the front (or rear) panel, screen pixels 960x544
   vdb.py swipe X0 Y0 X1 Y1 [--ms 400] [--back]
   vdb.py kprintf on|off            mirror the kernel's own printf output into the log stream
+  vdb.py ps [pid]                  a process (default: the one on screen): title, threads, modules
+  vdb.py peek ADDR LEN [--pid P] [-o file]   read process memory (hex dump, or to a file)
+  vdb.py poke ADDR HEXBYTES [--pid P]        write process memory, e.g. poke 0x81001000 00112233
+  vdb.py profile [SECONDS] [--pid P] [--us 1000] [--raw file]
+                                   sample every thread's program counter, resolve against the
+                                   binaries in --build (default ./build) with
+                                   the load bases the launcher logged, print the hot functions
+  vdb.py autopsy [--elf f] [--all] pull the newest core dump and run vita-parse-core on it
   vdb.py unlock                    peel the lock screen (a swipe from the top right corner)
   vdb.py osd "text" | off          text drawn over every frame (lines split at \\n, 6 x 60)
   vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
@@ -55,7 +63,8 @@ RSP = struct.Struct("<IIiI")
 
 (CMD_PING, CMD_STATUS, CMD_LIST, CMD_STAT, CMD_GET, CMD_PUT_OPEN, CMD_PUT_DATA,
  CMD_PUT_CLOSE, CMD_MKDIR, CMD_REMOVE, CMD_RMDIR, CMD_RENAME, CMD_POWER,
- CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT, CMD_TOUCH, CMD_OSD, CMD_KPRINTF) = range(1, 21)
+ CMD_LAUNCH, CMD_KILL, CMD_SCREEN, CMD_INPUT, CMD_TOUCH, CMD_OSD, CMD_KPRINTF,
+ CMD_PEEK, CMD_POKE, CMD_PROCINFO, CMD_PROFILE) = range(1, 25)
 BUTTONS = {"select": 0x1, "l3": 0x2, "r3": 0x4, "start": 0x8, "up": 0x10, "right": 0x20, "down": 0x40,
            "left": 0x80, "l": 0x100, "r": 0x200, "l1": 0x400, "r1": 0x800, "triangle": 0x1000,
            "circle": 0x2000, "cross": 0x4000, "square": 0x8000, "ps": 0x10000}
@@ -356,6 +365,214 @@ def opt_int(args, name, default):
     return default
 
 
+def read_frames(b, what):
+    """Collect the data frames of a streaming reply until the empty one."""
+    out = bytearray()
+    while True:
+        _, status, data = b.reply(timeout=20000)
+        if not data:
+            check(status, what)
+            return bytes(out), status
+        out += data
+
+
+def cmd_ps(b, pid):
+    b.send(CMD_PROCINFO, arg=pid & 0xFFFFFFFF)
+    text, _ = read_frames(b, "ps")
+    for line in text.decode("utf-8", "replace").splitlines():
+        kind, rest = line[0], line[2:]
+        if kind == "P":
+            pid_s, title = rest.split(" ", 1)
+            print(f"process {pid_s} title {title}")
+        elif kind == "T":
+            thid, prio, status, name = rest.split(" ", 3)
+            print(f"  thread {thid} prio {int(prio):3d} status 0x{int(status):x} {name}")
+        elif kind == "M":
+            name, base, size, path = rest.split(" ", 3)
+            print(f"  module {name:24s} {base} {size:>8s} {path}")
+
+
+def cmd_peek(b, pid, addr, length, out=None):
+    b.send(CMD_PEEK, struct.pack("<II", addr, length), arg=pid & 0xFFFFFFFF)
+    data, _ = read_frames(b, "peek")
+    if out:
+        open(out, "wb").write(data)
+        print(f"{out}: {len(data)} bytes from 0x{addr:08x}")
+        return
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hexs = " ".join(f"{c:02x}" for c in chunk)
+        asc = "".join(chr(c) if 32 <= c < 127 else "." for c in chunk)
+        print(f"{addr + off:08x}  {hexs:<48s} {asc}")
+
+
+def cmd_poke(b, pid, addr, data):
+    b.send(CMD_POKE, struct.pack("<I", addr) + data, arg=pid & 0xFFFFFFFF)
+    _, status, rdata = b.reply()
+    (written,) = struct.unpack("<I", rdata[:4]) if len(rdata) >= 4 else (0,)
+    check(status, "poke")
+    print(f"poked {written} bytes at 0x{addr:08x}")
+
+
+class ModuleMap:
+    """Where things are loaded: the launcher's own log for the game's .so
+    files (mapped by its loader, not the kernel) and ps for kernel modules."""
+
+    def __init__(self, b, build_dir):
+        self.mods = []  # (base, end, name, elf, link_vaddr)
+        self.build = build_dir
+        # the game libraries, from the launcher's boot log
+        try:
+            b.send(CMD_GET, path_arg("ux0:data/boot.txt"))
+            _, status, _ = b.reply()
+            text = read_frames(b, "boot log")[0].decode("utf-8", "replace") if status == 0 else ""
+        except SystemExit:
+            text = ""
+        import re
+        seen = {}
+        for m in re.finditer(r"^(\S+\.so): mapped text 0x([0-9a-f]+) size 0x([0-9a-f]+)", text, re.M):
+            name, base, size = m.group(1), int(m.group(2), 16), int(m.group(3), 16)
+            seen[name] = (base, base + size)  # the last mapping wins (a relaunch)
+        for name, (base, end) in seen.items():
+            self.mods.append((base, end, name, self.find_elf(name), 0))
+        # kernel modules of the process (the launcher is "eboot.bin")
+        b.send(CMD_PROCINFO, arg=0)
+        for line in read_frames(b, "ps")[0].decode("utf-8", "replace").splitlines():
+            if line.startswith("M "):
+                name, base, size, path = line[2:].split(" ", 3)
+                base, size = int(base, 16), int(size, 16)
+                elf, link = (None, 0)
+                if path.endswith("eboot.bin"):
+                    elf = self.find_elf("eboot.elf")
+                    link = self.elf_text_vaddr(elf) if elf else 0
+                self.mods.append((base, base + size, name, elf, link))
+        self.mods.sort()
+
+    def find_elf(self, name):
+        if not self.build:
+            return None
+        for root, _, files in os.walk(self.build):
+            if name in files:
+                return os.path.join(root, name)
+        return None
+
+    @staticmethod
+    def elf_text_vaddr(elf):
+        import subprocess
+        try:
+            out = subprocess.run(["arm-vita-eabi-readelf", "-l", elf], capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if parts and parts[0] == "LOAD":
+                    return int(parts[2], 16)
+        except FileNotFoundError:
+            pass
+        return 0x81000000
+
+    def locate(self, pc):
+        for base, end, name, elf, link in self.mods:
+            if base <= pc < end:
+                return name, pc - base, elf, link
+        return None, pc, None, 0
+
+
+def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
+    import subprocess
+    b.send(CMD_PROFILE, struct.pack("<II", pid & 0xFFFFFFFF, us), arg=1)
+    _, status, _ = b.reply()
+    check(status, "profile start")
+    print(f"sampling pid {'on screen' if pid == 0 else hex(pid)} every {us} us for {seconds} s...", file=sys.stderr)
+    time.sleep(seconds)
+    b.send(CMD_PROFILE, arg=0)
+    _, status, data = b.reply()
+    check(status, "profile stop")
+    b.send(CMD_PROFILE, arg=2)
+    text, _ = read_frames(b, "profile dump")
+    text = text.decode("utf-8", "replace")
+    if raw_out:
+        open(raw_out, "w").write(text)
+    mm = ModuleMap(b, build_dir)
+    threads, cur = [], None
+    rounds = 0
+    for line in text.splitlines():
+        kind, rest = line[0], line[2:]
+        if kind == "R":
+            rounds = int(rest.split()[0])
+        elif kind == "T":
+            thid, samples, running, overflow, name = rest.split(" ", 4)
+            cur = {"thid": thid, "samples": int(samples), "running": int(running), "overflow": int(overflow), "name": name, "pcs": {}}
+            threads.append(cur)
+        elif kind == "S" and cur is not None:
+            parts = rest.split()
+            pc, lr, count = (int(parts[0], 16), int(parts[1], 16), int(parts[2])) if len(parts) == 3 else (int(parts[0], 16), 0, int(parts[1]))
+            cur["pcs"][(pc, lr)] = cur["pcs"].get((pc, lr), 0) + count
+    print(f"{rounds} rounds, {len(threads)} threads, modules known: {len(mm.mods)}")
+    threads.sort(key=lambda t: -t["running"])
+    cache = {}
+
+    SYSTEM = ("SceLibKernel", "SceDriverUser", "SceLibc", "SceSysmem", "SceKernelThreadMgr")
+
+    def symbolize(pc, lr=0):
+        name, off, elf, link = mm.locate(pc)
+        # a sample inside a system library's stub belongs to the function that called it
+        if lr and name is not None and name.startswith(SYSTEM):
+            lname, _, _, _ = mm.locate(lr)
+            if lname is not None and not lname.startswith(SYSTEM):
+                return symbolize(lr) + f"  (in {name})"
+        if name is None:
+            return f"0x{pc:08x}"
+        key = (elf, off + link)
+        if elf and key not in cache:
+            try:
+                out = subprocess.run(["arm-vita-eabi-addr2line", "-f", "-C", "-e", elf, f"0x{off + link:x}"], capture_output=True, text=True).stdout.split("\n")
+                cache[key] = out[0] if out and out[0] and out[0] != "??" else None
+            except FileNotFoundError:
+                cache[key] = None
+        func = cache.get(key)
+        return f"{name}+0x{off:x}" + (f" {func}" if func else "")
+
+    for t in threads:
+        if t["samples"] == 0:
+            continue
+        pct_run = 100.0 * t["running"] / max(rounds, 1)
+        if t["running"] == 0:
+            continue
+        print(f"\n{t['name']} ({t['thid']}): on a core {pct_run:.0f}% of the time ({t['running']} of {t['samples']} samples), {t['overflow']} dropped")
+        # aggregate by function (or address when unresolved)
+        agg = {}
+        for (pc, lr), count in t["pcs"].items():
+            sym = symbolize(pc, lr)
+            agg[sym] = agg.get(sym, 0) + count
+        for sym, count in sorted(agg.items(), key=lambda kv: -kv[1])[:12]:
+            print(f"  {100.0 * count / max(t['running'], 1):5.1f}%  {sym}")
+
+
+def cmd_autopsy(b, elf, all_dumps=False):
+    import subprocess
+    cores_dir = os.path.expanduser("~/code-projects/vita-logs/cores")
+    os.makedirs(cores_dir, exist_ok=True)
+    b.send(CMD_LIST, path_arg("ux0:data/"))
+    text, _ = read_frames(b, "ls")
+    dumps = []
+    for line in text.decode("utf-8", "replace").splitlines():
+        parts = line.split(" ", 4)
+        if len(parts) == 5 and parts[4].startswith("psp2core-") and parts[4].endswith(".psp2dmp"):
+            dumps.append((parts[2] + " " + parts[3], int(parts[1]), parts[4]))
+    if not dumps:
+        print("no core dumps in ux0:data/")
+        return
+    dumps.sort()
+    for when, size, name in (dumps if all_dumps else dumps[-1:]):
+        local = os.path.join(cores_dir, name)
+        if not os.path.exists(local) or os.path.getsize(local) != size:
+            print(f"pulling {name} ({size} bytes, {when})", file=sys.stderr)
+            cmd_get(b, "ux0:data/" + name, local)
+        parser = os.path.expanduser("~/code-projects/vita-refs/vita-parse-core/main.py")
+        print(f"=== {name} ({when})")
+        r = subprocess.run([sys.executable, parser, local, elf], capture_output=True, text=True)
+        print(r.stdout[-6000:] if r.returncode == 0 else (r.stdout[-2000:] + r.stderr[-2000:]))
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -436,6 +653,25 @@ def main():
         back = "--back" in rest and (rest.remove("--back") or True)
         ms = opt_int(rest, "--ms", 400)
         cmd_touch(b, *(int(v) for v in rest[:4]), ms, "rear swipe" if back else "swipe", back)
+    elif cmd == "ps" and len(rest) <= 1:
+        cmd_ps(b, int(rest[0], 0) if rest else 0)
+    elif cmd == "peek" and len(rest) >= 2:
+        pid = opt_int(rest, "--pid", 0)
+        out = rest[rest.index("-o") + 1] if "-o" in rest else None
+        cmd_peek(b, pid, int(rest[0], 0), int(rest[1], 0), out)
+    elif cmd == "poke" and len(rest) >= 2:
+        pid = opt_int(rest, "--pid", 0)
+        cmd_poke(b, pid, int(rest[0], 0), bytes.fromhex(rest[1]))
+    elif cmd == "profile":
+        pid = opt_int(rest, "--pid", 0)
+        us = opt_int(rest, "--us", 1000)
+        build = rest[rest.index("--build") + 1] if "--build" in rest else os.path.expanduser("./build")
+        raw = rest[rest.index("--raw") + 1] if "--raw" in rest else None
+        seconds = int(rest[0]) if rest and rest[0].isdigit() else 10
+        cmd_profile(b, seconds, pid, us, build, raw)
+    elif cmd == "autopsy":
+        elf = rest[rest.index("--elf") + 1] if "--elf" in rest else os.path.expanduser("./build/eboot.elf")
+        cmd_autopsy(b, elf, "--all" in rest)
     elif cmd == "kprintf" and len(rest) == 1 and rest[0] in ("on", "off"):
         b.send(CMD_KPRINTF, arg=1 if rest[0] == "on" else 0)
         _, status, _ = b.reply()

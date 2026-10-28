@@ -161,6 +161,7 @@ int module_start( SceSize argc, const void *args )
 
 int module_stop( SceSize argc, const void *args )
 {
+	ProfileStop();
 	KprintfCapture( 0 );
 	RemoveDisplayHook();
 	RemoveInputHooks();
