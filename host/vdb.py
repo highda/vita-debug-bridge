@@ -522,26 +522,35 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
         elif kind == "S" and cur is not None:
             parts = rest.split()
             hexes, count = [int(v, 16) for v in parts[:-1]], int(parts[-1])
-            pc, lr, ra = (hexes + [0, 0, 0])[:3]
-            cur["pcs"][(pc, lr, ra)] = cur["pcs"].get((pc, lr, ra), 0) + count
+            key = tuple((hexes + [0, 0, 0, 0])[:4])  # pc, lr, ra, ra2
+            cur["pcs"][key] = cur["pcs"].get(key, 0) + count
     print(f"{rounds} rounds, {len(threads)} threads, modules known: {len(mm.mods)}")
     threads.sort(key=lambda t: -t["running"])
     cache = {}
 
     SYSTEM = ("SceLibKernel", "SceDriverUser", "SceLibc", "SceSysmem", "SceKernelThreadMgr")
 
-    def symbolize(pc, lr=0, ra=0):
+    HELPERS = ("pte_", "pthread_", "sched_yield", "__wrap_", "_malloc_r", "_free_r", "memset", "memcpy")
+
+    def symbolize(pc, lr=0, ra=0, ra2=0):
         name, off, elf, link = mm.locate(pc)
-        # a sample inside a system library's stub belongs to the function that called it
-        if lr and name is not None and name.startswith(SYSTEM):
-            lname, _, _, _ = mm.locate(lr)
-            # lr in the stub as well: the return address the stub pushed on the stack
-            if ra and lname is not None and lname.startswith(SYSTEM):
-                rname, _, _, _ = mm.locate(ra)
-                if rname is not None and not rname.startswith(SYSTEM):
-                    return symbolize(ra) + f"  (in {name})"
-            if lname is not None and not lname.startswith(SYSTEM):
-                return symbolize(lr) + f"  (in {name})"
+        # a sample inside a system library's stub belongs to the function that
+        # called it: lr, or the return addresses the sampler read off the stack
+        # when lr is in the stub as well; a small helper (the pthread TLS
+        # lookup, the allocator) is skipped for its own caller when known
+        if name is not None and name.startswith(SYSTEM):
+            frames = [a for a in (lr, ra, ra2) if a]
+            for i, a in enumerate(frames):
+                fname, _, _, _ = mm.locate(a)
+                if fname is None or fname.startswith(SYSTEM):
+                    continue
+                sym = symbolize(a)
+                if any(h in sym for h in HELPERS):
+                    for a2 in frames[i + 1:]:
+                        f2, _, _, _ = mm.locate(a2)
+                        if f2 is not None and not f2.startswith(SYSTEM):
+                            return symbolize(a2) + f"  (via {sym.split(' ', 1)[-1].split('(')[0].strip()}, in {name})"
+                return sym + f"  (in {name})"
         if name is None:
             return f"0x{pc:08x}"
         key = (elf, off + link)
@@ -563,8 +572,8 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
         print(f"\n{t['name']} ({t['thid']}): on a core {pct_run:.0f}% of the time ({t['running']} of {t['samples']} samples), {t['overflow']} dropped")
         # aggregate by function (or address when unresolved)
         agg = {}
-        for (pc, lr, ra), count in t["pcs"].items():
-            sym = symbolize(pc, lr, ra)
+        for (pc, lr, ra, ra2), count in t["pcs"].items():
+            sym = symbolize(pc, lr, ra, ra2)
             agg[sym] = agg.get(sym, 0) + count
         for sym, count in sorted(agg.items(), key=lambda kv: -kv[1])[:12]:
             print(f"  {100.0 * count / max(t['running'], 1):5.1f}%  {sym}")

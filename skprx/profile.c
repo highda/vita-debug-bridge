@@ -91,7 +91,7 @@ void CmdProcInfo( SceUID pid )
 #define PROF_BUCKETS	4096	// per thread, power of two
 typedef struct
 {
-	unsigned pc, lr, ra, count;	// lr: the return address, so the host attributes a sample in a syscall stub to its caller;
+	unsigned pc, lr, ra, ra2, count;	// lr: the return address, so the host attributes a sample in a syscall stub to its caller;
 								// ra: the first return address found on the stack, for when lr is in the stub as well
 } ProfBucket_t;
 
@@ -127,7 +127,7 @@ static ProfThread_t *ProfSlot( SceUID thid )
 	return p;
 }
 
-static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr, unsigned ra )
+static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr, unsigned ra, unsigned ra2 )
 {
 	// keyed on pc and lr only: the stack address is kept from the first
 	// sample, keying on it as well overflowed the table on a flat profile
@@ -140,13 +140,17 @@ static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr, unsigned ra )
 			b->pc = pc;
 			b->lr = lr;
 			b->ra = ra;
+			b->ra2 = ra2;
 			b->count = 1;
 			return;
 		}
 		if ( b->pc == pc && b->lr == lr )
 		{
 			if ( !b->ra )
+			{
 				b->ra = ra;
+				b->ra2 = ra2;
+			}
 			b->count++;
 			return;
 		}
@@ -268,16 +272,22 @@ static int ProfSampler( SceSize args, void *argp )
 				// code address and is not lr is the stub's own return address
 				// when pc and lr both sit in a system library's stub (its
 				// inner call pushed lr). Cheap: 64 bytes from the process
-				unsigned ra = 0, words[16];
+				// (two of them: the second is the caller of the first's
+				// function when that is a small helper such as the pthread
+				// TLS lookup). Any user address with the Thumb bit; even
+				// words are mostly data pointers, all-ones is a sentinel
+				unsigned ra = 0, ra2 = 0, words[24];
 				if ( sp >= 0x80000000u && ksceKernelCopyFromUserProc( s_ProfPid, words, (const void *)( sp & ~3u ), sizeof( words ) ) >= 0 )
-					for ( int w = 0; w < 16; w++ )
-						if ( words[w] >= 0x80000000u && words[w] != lr && ( words[w] & 1 ) )	// any user address with the Thumb bit; even words are mostly data pointers
+					for ( int w = 0; w < 24 && !ra2; w++ )
+						if ( words[w] >= 0x80000000u && words[w] != 0xFFFFFFFFu && words[w] != lr && ( words[w] & 1 ) )
 						{
-							ra = words[w];
-							break;
+							if ( !ra )
+								ra = words[w];
+							else if ( words[w] != ra )
+								ra2 = words[w];
 						}
 				p->nRunning++;
-				ProfCount( p, pc, lr, ra );
+				ProfCount( p, pc, lr, ra, ra2 );
 			}
 		}
 		nRound++;
@@ -342,7 +352,7 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		if ( Emit( VDB_CMD_PROFILE, &nUsed, "T 0x%08x %u %u %u %s\n", (unsigned)p->thid, p->nSamples, p->nRunning, p->nOverflow, p->name ) < 0 )
 			return;
 		for ( int b = 0; b < PROF_BUCKETS; b++ )
-			if ( p->buckets[b].count && Emit( VDB_CMD_PROFILE, &nUsed, "S %x %x %x %u\n", p->buckets[b].pc, p->buckets[b].lr, p->buckets[b].ra, p->buckets[b].count ) < 0 )
+			if ( p->buckets[b].count && Emit( VDB_CMD_PROFILE, &nUsed, "S %x %x %x %x %u\n", p->buckets[b].pc, p->buckets[b].lr, p->buckets[b].ra, p->buckets[b].ra2, p->buckets[b].count ) < 0 )
 				return;
 	}
 	Flush( VDB_CMD_PROFILE, &nUsed, 0 );
