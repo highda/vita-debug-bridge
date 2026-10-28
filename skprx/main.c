@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.4.3"
+#define VDB_VERSION		"0.4.4"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -1009,6 +1009,11 @@ static int ChangeSetting( int interfaceNumber, int alternateSetting, int bus )
 
 static int Attach( int usb_version, void *user_data )
 {
+	// the host configured us: tell ScePower the bus is configured and ask
+	// for USB charging (the system's own USB stack does this for its
+	// devices; with ours in place the battery only drained)
+	kscePowerBatterySetUsbStatus( SCE_POWER_BATTERY_USB_STATUS_CONFIGURED );
+	kscePowerBatteryEnableUsbCharging();
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_IN] );
 	ksceUdcdClearFIFO( &endpoints[VDB_EP_IN] );
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_OUT] );
@@ -1021,6 +1026,7 @@ static int Attach( int usb_version, void *user_data )
 
 static void Detach( void *user_data )
 {
+	kscePowerBatterySetUsbStatus( SCE_POWER_BATTERY_USB_STATUS_ACTIVE );
 	ksceKernelSetEventFlag( s_Evf, EVF_DISCONNECTED );
 }
 
