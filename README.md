@@ -94,6 +94,9 @@ VitaSDK: `make` in `skprx/` builds `vdb.skprx` (main.c: thread and module entry;
 
 ## Lessons the hard way
 
+- A dead USB cable looks exactly like a dead plugin from the Mac. The plugin's notes in `boot.txt` tell them apart: a thread that keeps writing status lines and a boot whose MTP wait times out mean no cable. VitaShell's USB mode is the other test, it is the system's own stack.
+- Re-queuing a UDCD receive request object from its own completion is refused now and then (0x80243007); with no receive outstanding every host write fails with an I/O error although the device is enumerated. One request object per buffer, a retry, and a watchdog that re-queues from the thread tick. The host's `reset` re-attaches a stuck device meanwhile.
+
 - Taking the USB port during boot (at 13 s) powered the Vita off, three boots in a row: SceShell brings up its own USB services afterwards and the two collide. Wait for the system's MTP driver to be activated (`ksceUdcdWaitState`), then take over; or do it on a hotkey.
 - Set every flag a kernel thread reads *before* starting the thread; ours raced `module_start` and silently never activated.
 - A verdict file (`boot.txt`) written at each step is the only debugger you have for the plugin that is itself the debugger.

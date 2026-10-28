@@ -27,8 +27,14 @@ static unsigned char *s_DataBuf = s_DataBufStatic;
 static unsigned s_nDataChunk = 4096;
 static SceUID s_Block = -1;
 
-static SceUdcdDeviceRequest s_TxReq, s_RxReq, s_DataReq;
+static SceUdcdDeviceRequest s_TxReq, s_DataReq;
+// one request object per receive buffer: re-queuing the object that has just
+// completed, from its own completion, was refused now and then
+// (0x80243007), which left no receive outstanding and the host's writes
+// failing until it re-attached
+static SceUdcdDeviceRequest s_RxReq[RX_BUFS];
 static int s_nRxQueuedIdx;
+static volatile int s_bRxOutstanding;
 static volatile unsigned s_nRxCompleted;	// receives finished (callback)
 static unsigned s_nRxProcessed;				// receives handled by the thread
 
@@ -42,6 +48,7 @@ static void OnSent( SceUdcdDeviceRequest *req )
 
 static void OnReceived( SceUdcdDeviceRequest *req )
 {
+	s_bRxOutstanding = 0;
 	s_nRxCompleted++;
 	ksceKernelSetEventFlag( g_Evf, EVF_RECEIVED );
 }
@@ -69,15 +76,26 @@ static int QueueReceive( int idx )
 	// re-reads the previous command. Seen on hardware: the first command
 	// worked, every later one re-ran the old one with a garbage path
 	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
-	memset( &s_RxReq, 0, sizeof( s_RxReq ) );
-	s_RxReq.endpoint = &endpoints[VDB_EP_OUT];
-	s_RxReq.data = s_pRxBuf[idx];
-	s_RxReq.size = RX_SIZE;
-	s_RxReq.onComplete = OnReceived;
-	s_nRxQueuedIdx = idx;
-	int r = ksceUdcdReqRecv( &s_RxReq );
-	if ( r < 0 )
-		FileNotef( "vdb: ReqRecv(%d) failed 0x%08x", idx, r );
+	SceUdcdDeviceRequest *pReq = &s_RxReq[idx];
+	int r = -1;
+	for ( int nTry = 0; nTry < 5 && r < 0; nTry++ )
+	{
+		if ( nTry )
+			ksceKernelDelayThread( 200 );
+		memset( pReq, 0, sizeof( *pReq ) );
+		pReq->endpoint = &endpoints[VDB_EP_OUT];
+		pReq->data = s_pRxBuf[idx];
+		pReq->size = RX_SIZE;
+		pReq->onComplete = OnReceived;
+		s_nRxQueuedIdx = idx;
+		s_bRxOutstanding = 1;
+		r = ksceUdcdReqRecv( pReq );
+		if ( r < 0 )
+		{
+			s_bRxOutstanding = 0;
+			FileNotef( "vdb: ReqRecv(%d) failed 0x%08x (try %d)", idx, r, nTry + 1 );
+		}
+	}
 	return r;
 }
 
@@ -95,12 +113,23 @@ int UsbTakeFrame( unsigned char **ppFrame )
 	// the one outstanding request finished into buffer idx: take its
 	// length, queue the other buffer, hand idx out while USB fills the other
 	int idx = s_nRxQueuedIdx;
-	int nLen = s_RxReq.transmitted;
+	int nLen = s_RxReq[idx].transmitted;
 	s_nRxProcessed = s_nRxCompleted;
 	QueueReceive( ( idx + 1 ) % s_nRxBufs );
 	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
 	*ppFrame = s_pRxBuf[idx];
 	return nLen;
+}
+
+// From the thread tick: with a host attached there must always be a receive
+// outstanding, or the host's next command times out
+void UsbWatchdog( void )
+{
+	if ( g_bHostAttached && g_bActive && !s_bRxOutstanding && s_nRxProcessed == s_nRxCompleted )
+	{
+		FileNotef( "vdb: no receive outstanding, queued again (uptime %u s)", Uptime() );
+		QueueReceive( ( s_nRxQueuedIdx + 1 ) % s_nRxBufs );
+	}
 }
 
 int UsbStreamLog( void )

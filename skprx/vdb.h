@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.6.8"
+#define VDB_VERSION		"0.6.9"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_NOTE_FILE	VDB_DIR "boot.txt"
@@ -160,6 +160,7 @@ extern int g_bHostAttached;			// a host configured the device (set by the thread
 int UsbRegister( void );				// driver registration and DMA buffers, from module_start
 void UsbUnregister( void );
 void UsbStartReceiving( void );			// after a host attached
+void UsbWatchdog( void );				// from the thread tick: a receive must be outstanding while a host is attached
 int UsbTakeFrame( unsigned char **ppFrame );	// a received command frame, 0 when none; queues the next receive
 int UsbStreamLog( void );				// sends the next log chunk, 1 when a send is in flight
 unsigned char *ReplyPayload( void );

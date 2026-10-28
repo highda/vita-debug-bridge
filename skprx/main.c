@@ -83,6 +83,7 @@ static int UsbThread( SceSize args, void *argp )
 				}
 			}
 			InputTick();
+			UsbWatchdog();
 			if ( nTicks % 5 == 0 )
 				UsbRetakeIfLost();
 			Hotkeys( &nPrevButtons );

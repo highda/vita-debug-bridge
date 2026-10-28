@@ -17,6 +17,9 @@
   vdb.py rmdir ux0:data/dir
   vdb.py mv ux0:data/a ux0:data/b
   vdb.py reboot                    cold reboot (also: reboot soft, poweroff, suspend)
+  vdb.py reset                     USB reset of the bridge device from this side (a stuck pipe:
+                                   commands time out although the device is enumerated); stop
+                                   any `logs` first, the reset needs the device to itself
   vdb.py launch ABCD12345          start an installed app through the shell (needs vdb_shell.suprx)
   vdb.py kill [pid]                kill a process (default: the one that owns the screen; never the shell)
   vdb.py screen [out.png]          grab the screen (default: screen-<time>.png)
@@ -579,6 +582,17 @@ def main():
         print(__doc__)
         return 1
     cmd, rest = args[0], args[1:]
+    if cmd == "reset":
+        dev = usb.core.find(idVendor=VID, idProduct=PID)
+        if dev is None:
+            sys.exit("no vdb device on the bus")
+        try:
+            dev.reset()
+        except usb.core.USBError as e:
+            sys.exit(f"reset failed: {e} (another process holding the device, such as a running `logs`?)")
+        time.sleep(2)
+        print("reset done; the Vita re-attaches and queues a fresh receive")
+        return 0
     if cmd == "logs":
         path = rest[rest.index("--file") + 1] if "--file" in rest else None
         logs(stamp="--ts" in rest, path=path)
