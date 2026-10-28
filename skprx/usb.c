@@ -211,13 +211,15 @@ int SendReply( unsigned nCmd, int nStatus, unsigned nLen )
 // drained the battery from 92 to 24 percent. ScePower's own charging flag
 // stays off on the bridge, the capacity nevertheless rises
 //-----------------------------------------------------------------------------
+// Only the software request is repeated here. The Syscon-facing USB status
+// is sent on attach and detach alone: it was sent every five seconds from
+// 0.4.5 on, and the USB port of the Vita went dead twice under game load,
+// once in a way that outlived a reboot until the system's own USB stack was
+// started. A Syscon state confused by repeated status commands fits that
 void UsbChargeNudge( void )
 {
 	if ( g_bHostAttached && !kscePowerIsBatteryCharging() )
-	{
-		kscePowerBatterySetUsbStatus( SCE_POWER_BATTERY_USB_STATUS_CONFIGURED );
 		kscePowerBatteryEnableUsbCharging();
-	}
 }
 
 //-----------------------------------------------------------------------------

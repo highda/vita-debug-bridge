@@ -71,14 +71,17 @@ static int UsbThread( SceSize args, void *argp )
 			nTicks++;
 			if ( nTicks % 25 == 0 )
 			{
-				Log( "vdb: alive %u (uptime %u s, ring %u used, dropped %u, host %s)", ++nBeats, Uptime(), RingUsed(), RingDropped(),
-					g_bHostAttached ? "attached" : "none" );
+				Log( "vdb: alive %u (uptime %u s, ring %u used, dropped %u, host %s, usb 0x%x, bus 0x%x)", ++nBeats, Uptime(), RingUsed(), RingDropped(),
+					g_bHostAttached ? "attached" : "none", (unsigned)ksceUdcdGetDeviceState(), (unsigned)ksceUdcdGetDrvState( "USBDeviceControllerDriver" ) );
 				if ( g_bActive )
 				{
 					// Keep the screen on and the Vita awake while the bridge
 					// is up: a Vita that locked itself went unreachable over
-					// USB more than once in the middle of a test session
-					ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
+					// USB more than once in the middle of a test session.
+					// Not below 20 percent though: with the port dead the
+					// screen drained the battery to zero overnight
+					if ( kscePowerGetBatteryLifePercent() >= 20 )
+						ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
 					UsbChargeNudge();
 				}
 			}
