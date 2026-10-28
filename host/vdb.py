@@ -26,6 +26,8 @@
   vdb.py touch X Y [--hold 100] [--back]   a finger on the front (or rear) panel, screen pixels 960x544
   vdb.py swipe X0 Y0 X1 Y1 [--ms 400] [--back]
   vdb.py kprintf on|off            mirror the kernel's own printf output into the log stream
+  vdb.py awake off|standby|screen  keep-awake while the bridge runs: off (default, the Vita sleeps and charges as usual),
+                                   standby (no automatic standby, the screen may go off), screen (nothing goes off)
   vdb.py ps [pid]                  a process (default: the one on screen): title, threads, modules
   vdb.py peek ADDR LEN [--pid P] [-o file]   read process memory (hex dump, or to a file)
   vdb.py poke ADDR HEXBYTES [--pid P]        write process memory, e.g. poke 0x81001000 00112233
@@ -60,6 +62,8 @@ EP_OUT = 0x02  # interface 1: commands
 EP_DATA = 0x83 # interface 1: replies and file data
 
 CMD_MAGIC = 0x31424456  # "VDB1"
+CMD_AWAKE = 25
+AWAKE_MODES = {"off": 0, "standby": 1, "screen": 2}
 RSP_MAGIC = 0x52424456  # "VDBR"
 HDR = struct.Struct("<IIII")   # cmd: magic, cmd, len, arg; rsp: magic, cmd, status(i), len
 RSP = struct.Struct("<IIiI")
@@ -694,6 +698,13 @@ def main():
     elif cmd == "autopsy":
         elf = rest[rest.index("--elf") + 1] if "--elf" in rest else os.path.expanduser("./build/eboot.elf")
         cmd_autopsy(b, elf, "--all" in rest)
+    elif cmd == "awake" and len(rest) == 1 and rest[0] in AWAKE_MODES:
+        b.send(CMD_AWAKE, arg=AWAKE_MODES[rest[0]])
+        _, status, _ = b.reply()
+        check(status, "awake")
+        print({"off": "keep-awake off: the Vita sleeps and charges as without the plugin",
+               "standby": "no automatic standby (the screen still goes off, the port stays up)",
+               "screen": "no standby and no screen off"}[rest[0]])
     elif cmd == "kprintf" and len(rest) == 1 and rest[0] in ("on", "off"):
         b.send(CMD_KPRINTF, arg=1 if rest[0] == "on" else 0)
         _, status, _ = b.reply()

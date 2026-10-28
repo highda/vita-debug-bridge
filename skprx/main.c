@@ -3,6 +3,7 @@
 
 static SceUID s_Thread = -1;
 static int s_bAutoStart;	// ux0:vdbplugin/usb_on existed at boot
+int g_nAwakeMode;		// off by default: the Vita sleeps and charges as it would without the plugin
 
 //-----------------------------------------------------------------------------
 // USB thread: streams the ring while a host is attached, runs the commands,
@@ -52,6 +53,9 @@ static int UsbThread( SceSize args, void *argp )
 		int w = ksceUdcdWaitState( &wp, 30 * 1000 * 1000 );
 		FileNotef( "vdb: mtp wait returned 0x%08x at uptime %u s, pausing 3 s", w, Uptime() );
 		ksceKernelDelayThread( 3 * 1000 * 1000 );
+		// the system's own device, for comparison with ours in the notes
+		FileNotef( "vdb: before takeover: usb state 0x%x, mtp 0x%x, charging status %d", (unsigned)ksceUdcdGetDeviceState(),
+			(unsigned)ksceUdcdGetDrvState( "USB_MTP_Driver" ), kscePowerGetBatteryChargingStatus() );
 		int ret = vdb_usb_start();
 		Log( "vdb: usb start after boot: 0x%08x (mtp wait 0x%08x)", ret, w );
 		FileNotef( "vdb " VDB_VERSION ": usb start after boot 0x%08x (mtp wait 0x%08x, uptime %u s)", ret, w, Uptime() );
@@ -71,19 +75,18 @@ static int UsbThread( SceSize args, void *argp )
 			nTicks++;
 			if ( nTicks % 25 == 0 )
 			{
-				Log( "vdb: alive %u (uptime %u s, ring %u used, dropped %u, host %s, usb 0x%x, bus 0x%x)", ++nBeats, Uptime(), RingUsed(), RingDropped(),
-					g_bHostAttached ? "attached" : "none", (unsigned)ksceUdcdGetDeviceState(), (unsigned)ksceUdcdGetDrvState( "USBDeviceControllerDriver" ) );
-				if ( g_bActive )
-				{
-					// Keep the screen on and the Vita awake while the bridge
-					// is up: a Vita that locked itself went unreachable over
-					// USB more than once in the middle of a test session.
-					// Not below 20 percent though: with the port dead the
-					// screen drained the battery to zero overnight
-					if ( kscePowerGetBatteryLifePercent() >= 20 )
-						ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
-					UsbChargeNudge();
-				}
+				Log( "vdb: alive %u (uptime %u s, ring %u used, dropped %u, host %s, usb 0x%x, awake %d%s)", ++nBeats, Uptime(), RingUsed(), RingDropped(),
+					g_bHostAttached ? "attached" : "none", (unsigned)ksceUdcdGetDeviceState(), g_nAwakeMode, UsbSuspended() ? ", suspended" : "" );
+				// Keep-awake is the host's choice (vdb.py awake): off, the
+				// Vita dims, sleeps and charges exactly as without the
+				// plugin; 1 cancels only the automatic standby (screen off,
+				// port alive, 500 mA go into the battery); 2 keeps the
+				// screen on as well. 0.2.3 to 0.6.12 forced mode 2 and a
+				// hung standby drained the battery to zero overnight
+				if ( g_nAwakeMode == 1 )
+					ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND );
+				else if ( g_nAwakeMode >= 2 )
+					ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
 			}
 			InputTick();
 			UsbWatchdog();
@@ -147,6 +150,7 @@ int module_start( SceSize argc, const void *args )
 	InstallInputHooks();
 	InstallDisplayHook();
 	InstallKprintfCapture();
+	UsbInstallSuspendHandler();
 
 	// decide the auto start before the thread runs (it once read the flag
 	// before module_start set it: the takeover never happened)

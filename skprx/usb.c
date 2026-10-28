@@ -206,20 +206,71 @@ int SendReply( unsigned nCmd, int nStatus, unsigned nLen )
 }
 
 //-----------------------------------------------------------------------------
-// Charging. The system's USB stack asks ScePower for USB charging for its
-// own devices; with ours in place nobody did, and a night on the bridge
-// drained the battery from 92 to 24 percent. ScePower's own charging flag
-// stays off on the bridge, the capacity nevertheless rises
+// Charging: nothing to do here, and 0.4.3 to 0.6.12 did too much. SceUdcd
+// owns USB charging for whatever class driver sits behind its controller
+// driver: it tells Syscon the USB state itself (2 on connect, 3 when
+// configured, 4 on suspend, 0 on teardown), asks ScePower for USB charging
+// from the "USB Power Supply" system setting, and rewrites the descriptor's
+// power fields from that setting (500 mA bus powered when on, 2 mA self
+// powered when off). Our own kscePowerBatterySetUsbStatus calls duplicated
+// the controller driver's, out of order with the real bus events. A host
+// port never grants more than 500 mA, and kscePowerIsBatteryCharging is
+// false on a host port by design (it needs Syscon's "power online"):
+// CmdStatus reads kscePowerGetBatteryChargingStatus instead
 //-----------------------------------------------------------------------------
-// Only the software request is repeated here. The Syscon-facing USB status
-// is sent on attach and detach alone: it was sent every five seconds from
-// 0.4.5 on, and the USB port of the Vita went dead twice under game load,
-// once in a way that outlived a reboot until the system's own USB stack was
-// started. A Syscon state confused by repeated status commands fits that
-void UsbChargeNudge( void )
+
+//-----------------------------------------------------------------------------
+// Standby. The USB service stops every controller when the system suspends
+// and restarts the ones that were running at resume; an activate or stop
+// from us inside that window fails (0x8024300E) or leaves the bus down, and
+// the retake below used to fire exactly then ("controller not started").
+// So: a system event handler marks the window, the thread stays off the
+// UDCD calls while it is open, and a few seconds after the last resume
+// event the normal retake check runs once. The handler itself only records
+// (no file I/O: the card is suspended too)
+//-----------------------------------------------------------------------------
+static volatile int s_bSuspended;
+static volatile unsigned s_nLastEventTick;	// Uptime() at the last suspend/resume event
+static unsigned s_nSuspendEvent, s_nResumeEvent;	// first suspend id, last resume id, for the notes
+static char s_SuspendNotes[96];
+
+static int SysEventHandler( int resume, int eventid, void *args, void *opt )
 {
-	if ( g_bHostAttached && !kscePowerIsBatteryCharging() )
-		kscePowerBatteryEnableUsbCharging();
+	if ( !resume )
+	{
+		if ( !s_bSuspended )
+			s_nSuspendEvent = (unsigned)eventid;
+		s_bSuspended = 1;
+	}
+	else
+		s_nResumeEvent = (unsigned)eventid;
+	s_nLastEventTick = Uptime();
+	return 0;
+}
+
+void UsbInstallSuspendHandler( void )
+{
+	int r = ksceKernelRegisterSysEventHandler( "vdb_suspend", SysEventHandler, NULL );
+	FileNotef( "vdb: suspend handler 0x%08x", r );
+}
+
+int UsbSuspended( void )
+{
+	// resumed: resume events seen and three quiet seconds since the last one
+	if ( s_bSuspended && s_nResumeEvent && Uptime() - s_nLastEventTick >= 3 )
+	{
+		s_bSuspended = 0;
+		snprintf( s_SuspendNotes, sizeof( s_SuspendNotes ), "suspend 0x%x resume 0x%x", s_nSuspendEvent, s_nResumeEvent );
+		s_nResumeEvent = 0;
+		FileNotef( "vdb: resumed (%s, uptime %u s, usb state 0x%x)", s_SuspendNotes, Uptime(), (unsigned)ksceUdcdGetDeviceState() );
+		Log( "vdb: resumed from standby (%s), usb state 0x%x", s_SuspendNotes, (unsigned)ksceUdcdGetDeviceState() );
+	}
+	return s_bSuspended;
+}
+
+const char *UsbSuspendNotes( void )
+{
+	return s_SuspendNotes;
 }
 
 //-----------------------------------------------------------------------------
@@ -249,10 +300,7 @@ static int ChangeSetting( int interfaceNumber, int alternateSetting, int bus )
 
 static int Attach( int usb_version, void *user_data )
 {
-	// the host configured us
-	kscePowerBatterySetUsbStatus( SCE_POWER_BATTERY_USB_STATUS_CONFIGURED );
-	kscePowerBatteryEnableUsbCharging();
-	kscePowerBatteryPermitCharging();	// in case the system's USB teardown left a forbid count behind
+	// the host configured us (SceUdcd has already told Syscon so)
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_IN] );
 	ksceUdcdClearFIFO( &endpoints[VDB_EP_IN] );
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_OUT] );
@@ -265,7 +313,6 @@ static int Attach( int usb_version, void *user_data )
 
 static void Detach( void *user_data )
 {
-	kscePowerBatterySetUsbStatus( SCE_POWER_BATTERY_USB_STATUS_ACTIVE );
 	ksceKernelSetEventFlag( g_Evf, EVF_DISCONNECTED );
 }
 
@@ -385,7 +432,6 @@ int vdb_usb_start( void )
 	}
 	g_bActive = 1;
 	s_bWantPort = 1;
-	kscePowerBatteryEnableUsbCharging();
 	Log( "vdb: usb device active (pid 0x%04x)", VDB_USB_PID );
 	return 0;
 }
@@ -412,19 +458,47 @@ int vdb_usb_stop( void )
 // host left the Vita unreachable. Called once a second while we believe we
 // own the port. (Requiring our own driver to report ACTIVATED as well, as
 // 0.4.2 did, retook the port every second: that flag is never set for it)
+// (The controller's state is read from the device state, bit 0x2000 =
+// controller started: ksceUdcdGetDrvState("USBDeviceControllerDriver")
+// returns -1, the controller is not in the class driver list, so the check
+// 0.3.1 to 0.6.12 made on it never fired.) Never inside the suspend
+// window, and at most once in five seconds
+// A failed retake backs off (5, 10, 20, 40, 60 s) and after eight failures
+// in a row the thread leaves the port alone until the hotkey or a reboot:
+// a retake that cannot succeed must not hammer the UDCD stack forever
 void UsbRetakeIfLost( void )
 {
-	if ( !s_bWantPort )
+	static unsigned s_nLastRetake, s_nWait = 5, s_nFailures;
+	if ( !s_bWantPort || UsbSuspended() )
 		return;
 	int mtp = ksceUdcdGetDrvState( "USB_MTP_Driver" );
-	int bus = ksceUdcdGetDrvState( "USBDeviceControllerDriver" );
-	int bLost = !g_bActive || ( mtp & SCE_UDCD_STATUS_ACTIVATED ) || !( bus & SCE_UDCD_STATUS_DRIVER_STARTED );
+	unsigned st = (unsigned)ksceUdcdGetDeviceState();
+	int bLost = !g_bActive || ( mtp & SCE_UDCD_STATUS_ACTIVATED ) || !( st & 0x2000 ) || !( st & SCE_UDCD_STATUS_ACTIVATED );
 	if ( !bLost )
+	{
+		s_nWait = 5;
+		s_nFailures = 0;
 		return;
+	}
+	if ( Uptime() - s_nLastRetake < s_nWait )
+		return;
+	if ( s_nFailures >= 8 )
+	{
+		if ( s_nFailures == 8 )
+			FileNotef( "vdb: port retake given up after 8 failures (usb state 0x%x, uptime %u s)", st, Uptime() );
+		s_nFailures = 9;
+		return;
+	}
+	s_nLastRetake = Uptime();
 	g_bActive = 0;
 	g_bHostAttached = 0;
 	PutAbort();
 	int r = vdb_usb_start();
-	Log( "vdb: the USB port was lost (mtp state 0x%x, bus 0x%x), retaken: 0x%08x", mtp, bus, r );
-	FileNotef( "vdb: port retaken (mtp 0x%x, bus 0x%x): 0x%08x (uptime %u s)", mtp, bus, r, Uptime() );
+	if ( r < 0 )
+	{
+		s_nFailures++;
+		s_nWait = s_nWait < 60 ? s_nWait * 2 : 60;
+	}
+	Log( "vdb: the USB port was lost (mtp state 0x%x, usb state 0x%x), retaken: 0x%08x", mtp, st, r );
+	FileNotef( "vdb: port retaken (mtp 0x%x, usb state 0x%x): 0x%08x (uptime %u s, failures %u)", mtp, st, r, Uptime(), s_nFailures );
 }

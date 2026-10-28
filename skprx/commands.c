@@ -363,14 +363,25 @@ static void CmdScreen( void )
 	SendReply( VDB_CMD_SCREEN, nErr, 0 );
 }
 
+// ScePower's charging status: 0 none, 1 charging (charger), 3 charging over
+// USB (Syscon's USB charge flags); kscePowerIsBatteryCharging is false on a
+// host port whatever happens, so it is not shown
+static const char *ChargingText( void )
+{
+	static char s_Text[32];
+	int st = kscePowerGetBatteryChargingStatus();
+	snprintf( s_Text, sizeof( s_Text ), st == 3 ? "charging over usb" : st == 1 ? "charging" : st == 0 ? "not charging" : "charging status %d", st );
+	return s_Text;
+}
+
 static void CmdStatus( void )
 {
 	// "rx N" is read by the host to size its command frames
 	int n = snprintf( (char *)ReplyPayload(), ReplyCapacity(),
-		"vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x, kprintf %s\n",
+		"vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x, awake %d, kprintf %s\n",
 		RingUsed(), RING_SIZE, RingDropped(), Uptime(), (int)s_PutFd, (unsigned)RX_SIZE,
-		kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), kscePowerIsBatteryCharging() ? "charging" : "not charging",
-		(unsigned)ksceUdcdGetDeviceState(), KprintfCapturing() ? "on" : "off" );
+		kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), ChargingText(),
+		(unsigned)ksceUdcdGetDeviceState(), g_nAwakeMode, KprintfCapturing() ? "on" : "off" );
 	SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 }
 
@@ -521,6 +532,11 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 		break;
 	case VDB_CMD_PROFILE:
 		CmdProfile( hdr.arg, pPayload, nPayload );
+		break;
+	case VDB_CMD_AWAKE:
+		g_nAwakeMode = hdr.arg > 2 ? 2 : (int)hdr.arg;
+		Log( "vdb: keep-awake mode %d (%s)", g_nAwakeMode, g_nAwakeMode == 0 ? "off" : g_nAwakeMode == 1 ? "no standby" : "no standby, screen on" );
+		SendReply( VDB_CMD_AWAKE, 0, 0 );
 		break;
 	case VDB_CMD_KPRINTF:
 		KprintfCapture( hdr.arg != 0 );

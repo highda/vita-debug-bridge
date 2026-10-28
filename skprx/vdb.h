@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.6.12"
+#define VDB_VERSION		"0.7.0"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_NOTE_FILE	VDB_DIR "boot.txt"
@@ -103,6 +103,7 @@ enum
 	VDB_CMD_POKE		= 22,	// arg: pid; payload: u32 addr, then the bytes; reply: status, payload u32 bytes written
 	VDB_CMD_PROCINFO	= 23,	// arg: pid; reply: text lines (process, threads, modules), then an empty frame
 	VDB_CMD_PROFILE		= 24,	// arg: 1 start (payload: u32 pid, u32 interval us), 0 stop, 2 dump (text lines, then an empty frame)
+	VDB_CMD_AWAKE		= 25,	// arg: 0 let the Vita sleep as it likes, 1 no automatic standby, 2 no standby and no screen off
 };
 
 typedef struct
@@ -166,8 +167,12 @@ int UsbStreamLog( void );				// sends the next log chunk, 1 when a send is in fl
 unsigned char *ReplyPayload( void );
 unsigned ReplyCapacity( void );
 int SendReply( unsigned nCmd, int nStatus, unsigned nLen );
+int kscePowerGetBatteryChargingStatus( void );	// not in this SDK header (NID in ScePowerForDriver)
 void UsbRetakeIfLost( void );			// the system took the port (an app launch): take it back
-void UsbChargeNudge( void );			// keep ScePower's USB charging request alive
+void UsbInstallSuspendHandler( void );	// standby: hands off during the system's suspend, retakes after resume
+int UsbSuspended( void );				// the system is between suspend and resume
+const char *UsbSuspendNotes( void );	// the last suspend/resume event ids, for the log
+extern int g_nAwakeMode;				// VDB_CMD_AWAKE: 0 none, 1 no standby, 2 no standby and no screen off
 int vdb_usb_start( void );
 int vdb_usb_stop( void );
 

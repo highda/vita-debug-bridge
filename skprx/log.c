@@ -61,11 +61,22 @@ void Log( const char *fmt, ... )
 	RingWrite( line, n );
 }
 
+// The notes file is capped: past 1 MB it starts over (the retake loop of
+// 0.6.12 wrote two megabytes of the same four lines in one night)
 void FileNote( const char *pszText )
 {
 	SceUID fd = ksceIoOpen( VDB_NOTE_FILE, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777 );
 	if ( fd < 0 )
 		return;
+	if ( ksceIoLseek( fd, 0, SCE_SEEK_END ) > 1024 * 1024 )
+	{
+		ksceIoClose( fd );
+		fd = ksceIoOpen( VDB_NOTE_FILE, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777 );
+		if ( fd < 0 )
+			return;
+		static const char s_szWrap[] = "vdb: notes file wrapped (1 MB)\n";
+		ksceIoWrite( fd, s_szWrap, sizeof( s_szWrap ) - 1 );
+	}
 	ksceIoWrite( fd, pszText, strlen( pszText ) );
 	ksceIoClose( fd );
 }
