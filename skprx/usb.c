@@ -39,6 +39,7 @@ static volatile int s_bRxOutstanding;
 static volatile unsigned s_nRxCompleted;	// receives finished (callback)
 static unsigned s_nRxProcessed;				// receives handled by the thread
 static unsigned s_nLastRecvError;			// for the status overlay
+static volatile int s_bLostByRecv;			// the host went away with a failed receive, not with a Detach
 static unsigned s_nRetakes, s_nRetakeFailures, s_nLastRetakeResult;
 
 //-----------------------------------------------------------------------------
@@ -109,6 +110,7 @@ static int QueueReceive( int idx )
 				// the controller stuck "in progress" until a cold boot
 				s_nLastRecvError = (unsigned)r;
 				g_bHostAttached = 0;
+				s_bLostByRecv = 1;
 				FileNotef( "vdb: ReqRecv(%d): bus driver not started, waiting for the next attach (usb state 0x%x, uptime %u s)", idx, (unsigned)ksceUdcdGetDeviceState(), Uptime() );
 				return r;
 			}
@@ -148,6 +150,22 @@ int UsbTakeFrame( unsigned char **ppFrame )
 // outstanding, or the host's next command times out
 void UsbWatchdog( void )
 {
+	// A USB suspend (the Mac asleep) fails the receive like a cable-out, but
+	// the resume keeps the configuration: no SET_CONFIGURATION, no Attach.
+	// 0.7.1 to 0.7.4 then waited for an attach forever and the bridge sat
+	// deaf until the host reset it. Back to "established" and not suspended
+	// after such a failure: the same path as an attach
+	if ( s_bLostByRecv && g_bActive && !g_bHostAttached )
+	{
+		unsigned st = (unsigned)ksceUdcdGetDeviceState();
+		if ( ( st & SCE_UDCD_STATUS_CONNECTION_ESTABLISHED ) && !( st & SCE_UDCD_STATUS_CONNECTION_SUSPENDED ) && ( st & SCE_UDCD_STATUS_CABLE_CONNECTED ) )
+		{
+			s_bLostByRecv = 0;
+			FileNotef( "vdb: bus established again after a failed receive (usb state 0x%x, uptime %u s), resuming", st, Uptime() );
+			ksceKernelSetEventFlag( g_Evf, EVF_CONNECTED );
+			return;
+		}
+	}
 	// (a completion of a cancelled, older request may have bumped the
 	// counters: what matters is only that nothing is outstanding now)
 	if ( g_bHostAttached && g_bActive && !s_bRxOutstanding )
@@ -308,6 +326,7 @@ static int ChangeSetting( int interfaceNumber, int alternateSetting, int bus )
 static int Attach( int usb_version, void *user_data )
 {
 	// the host configured us (SceUdcd has already told Syscon so)
+	s_bLostByRecv = 0;
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_IN] );
 	ksceUdcdClearFIFO( &endpoints[VDB_EP_IN] );
 	ksceUdcdReqCancelAll( &endpoints[VDB_EP_OUT] );
@@ -320,6 +339,7 @@ static int Attach( int usb_version, void *user_data )
 
 static void Detach( void *user_data )
 {
+	s_bLostByRecv = 0;
 	ksceKernelSetEventFlag( g_Evf, EVF_DISCONNECTED );
 }
 

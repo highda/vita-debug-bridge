@@ -96,6 +96,7 @@ VitaSDK: `make` in `skprx/` builds `vdb.skprx` (main.c: thread and module entry;
 ## Known caveats
 
 - **Standby and the cable.** While a host is attached and USB Power Supply is on, the firmware keeps the Vita from automatic standby and turns the power button into "screen off" (SceUdcd's own doing, the same as a stock Vita on a PC): the bridge stays up and the whole 500 mA go into the battery, which is the charging pause you want between sessions. Standby happens only with the cable out. Plugging the cable into a sleeping Vita triggers a charge wake, a partial one: screen off, back to standby after the auto-standby interval unless something keeps it awake. Set the automatic standby to several minutes (Settings > Power Save Settings), one minute is too short for the port to come back, or wake it with the power button.
+- **The Mac asleep** puts the bus into USB suspend: the Vita stops charging from it (a suspended device may draw almost nothing) and the bridge resumes by itself when the Mac wakes.
 - **500 mA.** A host port grants 500 mA and nothing on the Vita asks for more; a game draws more than that. Charge with the screen off, or from a charger.
 - **The charging indicator** stays off on a host port (ScePower's "is charging" needs Syscon's "power online"); `status` shows the real charging status.
 - **VitaShell's USB mode** is unavailable while the bridge holds the port: delete `ux0:vdbplugin/usb_on` and reboot, or press L+R+Start+Select to hand the port back.
