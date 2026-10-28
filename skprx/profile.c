@@ -111,11 +111,19 @@ static volatile int s_bProfRun;
 static unsigned s_nProfInterval = 1000, s_nProfRounds;
 static unsigned long long s_nProfStartUs, s_nProfEndUs;
 
-static ProfThread_t *ProfSlot( SceUID thid )
+static ProfThread_t *ProfFind( SceUID thid )
 {
 	for ( int i = 0; i < s_nProfThreads; i++ )
 		if ( s_Prof[i].thid == thid )
 			return &s_Prof[i];
+	return NULL;
+}
+
+static ProfThread_t *ProfSlot( SceUID thid )
+{
+	ProfThread_t *pFound = ProfFind( thid );
+	if ( pFound )
+		return pFound;
 	if ( s_nProfThreads >= PROF_THREADS )
 		return NULL;
 	ProfThread_t *p = &s_Prof[s_nProfThreads++];
@@ -175,13 +183,25 @@ static int ProfSampler( SceSize args, void *argp )
 			continue;
 		for ( int i = 0; i < nCopied; i++ )
 		{
-			ProfThread_t *p = ProfSlot( ids[i] );
-			if ( !p )
-				continue;
 			// the running state at this instant, before the suspend changes it
 			SceKernelThreadInfo info;
 			memset( &info, 0, sizeof( info ) );
 			info.size = sizeof( info );
+			// A slot (there are PROF_THREADS) only for a thread once it is
+			// seen running or ready: handed out in list order, idle threads
+			// (a dialog worker, the process's main thread) took them and the
+			// game's render thread, at 97 percent, was not profiled at all
+			ProfThread_t *p = ProfFind( ids[i] );
+			if ( !p )
+			{
+				if ( ksceKernelGetThreadInfo( ids[i], &info ) < 0 || !( info.status & ( SCE_THREAD_RUNNING | SCE_THREAD_READY ) ) )
+					continue;
+				p = ProfSlot( ids[i] );
+				if ( !p )
+					continue;
+				memset( &info, 0, sizeof( info ) );
+				info.size = sizeof( info );
+			}
 			// running, or ready: the sampler itself runs at a high priority
 			// and preempts the thread it is about to look at, which then
 			// reads as ready though it wanted the core
