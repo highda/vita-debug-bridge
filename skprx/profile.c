@@ -91,7 +91,8 @@ void CmdProcInfo( SceUID pid )
 #define PROF_BUCKETS	4096	// per thread, power of two
 typedef struct
 {
-	unsigned pc, lr, count;	// the return address lets the host attribute a sample in a syscall stub to its caller
+	unsigned pc, lr, ra, count;	// lr: the return address, so the host attributes a sample in a syscall stub to its caller;
+								// ra: the first return address found on the stack, for when lr is in the stub as well
 } ProfBucket_t;
 
 typedef struct
@@ -126,9 +127,9 @@ static ProfThread_t *ProfSlot( SceUID thid )
 	return p;
 }
 
-static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr )
+static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr, unsigned ra )
 {
-	unsigned h = ( ( pc >> 1 ) ^ ( lr << 7 ) ) * 2654435761u;
+	unsigned h = ( ( pc >> 1 ) ^ ( lr << 7 ) ^ ( ra << 13 ) ) * 2654435761u;
 	for ( unsigned i = 0; i < 16; i++ )
 	{
 		ProfBucket_t *b = &p->buckets[( h + i ) & ( PROF_BUCKETS - 1 )];
@@ -136,10 +137,11 @@ static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr )
 		{
 			b->pc = pc;
 			b->lr = lr;
+			b->ra = ra;
 			b->count = 1;
 			return;
 		}
-		if ( b->pc == pc && b->lr == lr )
+		if ( b->pc == pc && b->lr == lr && b->ra == ra )
 		{
 			b->count++;
 			return;
@@ -240,24 +242,38 @@ static int ProfSampler( SceSize args, void *argp )
 				Log( "vdb: profiler: first running sample: entry0 pc %08x lr %08x cpsr %08x, entry1 pc %08x lr %08x cpsr %08x",
 					regs.entry[0].pc, regs.entry[0].lr, regs.entry[0].cpsr, regs.entry[1].pc, regs.entry[1].lr, regs.entry[1].cpsr );
 			}
-			unsigned pc = 0, lr = 0;
+			unsigned pc = 0, lr = 0, sp = 0;
 			for ( int e = 0; e < 2; e++ )
 				if ( ( regs.entry[e].cpsr & 0x1F ) == 0x10 && regs.entry[e].pc >= 0x80000000u )
 				{
 					pc = regs.entry[e].pc;
 					lr = regs.entry[e].lr;
+					sp = regs.entry[e].sp;
 				}
 			if ( !pc )
 			{
 				int e = regs.entry[1].pc >= 0x80000000u ? 1 : 0;
 				pc = regs.entry[e].pc;
 				lr = regs.entry[e].lr;
+				sp = regs.entry[e].sp;
 			}
 			p->nSamples++;
 			if ( bRunning )
 			{
+				// the top of the user stack: the first word that looks like a
+				// code address and is not lr is the stub's own return address
+				// when pc and lr both sit in a system library's stub (its
+				// inner call pushed lr). Cheap: 64 bytes from the process
+				unsigned ra = 0, words[16];
+				if ( sp >= 0x80000000u && ksceKernelCopyFromUserProc( s_ProfPid, words, (const void *)( sp & ~3u ), sizeof( words ) ) >= 0 )
+					for ( int w = 0; w < 16; w++ )
+						if ( words[w] >= 0x80000000u && words[w] != lr && ( words[w] & 1 ) )	// any user address with the Thumb bit; even words are mostly data pointers
+						{
+							ra = words[w];
+							break;
+						}
 				p->nRunning++;
-				ProfCount( p, pc, lr );
+				ProfCount( p, pc, lr, ra );
 			}
 		}
 		nRound++;
@@ -322,7 +338,7 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		if ( Emit( VDB_CMD_PROFILE, &nUsed, "T 0x%08x %u %u %u %s\n", (unsigned)p->thid, p->nSamples, p->nRunning, p->nOverflow, p->name ) < 0 )
 			return;
 		for ( int b = 0; b < PROF_BUCKETS; b++ )
-			if ( p->buckets[b].count && Emit( VDB_CMD_PROFILE, &nUsed, "S %x %x %u\n", p->buckets[b].pc, p->buckets[b].lr, p->buckets[b].count ) < 0 )
+			if ( p->buckets[b].count && Emit( VDB_CMD_PROFILE, &nUsed, "S %x %x %x %u\n", p->buckets[b].pc, p->buckets[b].lr, p->buckets[b].ra, p->buckets[b].count ) < 0 )
 				return;
 	}
 	Flush( VDB_CMD_PROFILE, &nUsed, 0 );

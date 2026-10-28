@@ -184,6 +184,15 @@ int module_start( SceSize argc, const void *args )
 		ksceIoClose( fdFlag );
 		s_bAutoStart = 1;
 	}
+	// the keep-awake mode can be preset on the card (vdb.py awake sets it per boot)
+	SceUID fdAwake = ksceIoOpen( VDB_AWAKE_FILE, SCE_O_RDONLY, 0 );
+	if ( fdAwake >= 0 )
+	{
+		char ch = 0;
+		if ( ksceIoRead( fdAwake, &ch, 1 ) == 1 && ch >= '0' && ch <= '2' )
+			g_nAwakeMode = ch - '0';
+		ksceIoClose( fdAwake );
+	}
 	int st = ksceKernelStartThread( s_Thread, 0, NULL );
 	FileNotef( "vdb " VDB_VERSION ": loaded, thread 0x%08x start 0x%08x, usb %s", (unsigned)s_Thread, st,
 		s_bAutoStart ? "start scheduled after the shell is up" : "idle (no usb_on flag)" );

@@ -37,7 +37,7 @@
                                    the load bases the launcher logged, print the hot functions
   vdb.py autopsy [--elf f] [--all] pull the newest core dump and run vita-parse-core on it
   vdb.py unlock                    peel the lock screen (a swipe from the top right corner)
-  vdb.py osd "text" | off          text drawn over every frame (lines split at \\n, 6 x 60)
+  vdb.py osd "text" | off          text drawn over every frame (lines split at \\n, 8 x 110)
   vdb.py osd status                the plugin's status overlay (USB state, bridge, battery; hotkey L+R+Start+Up)
   vdb.py input cross [--hold 200]  press buttons and set sticks for a while:
                                    buttons: up down left right cross circle square triangle
@@ -319,7 +319,7 @@ def write_png(path, width, height, rows_rgb):
         f.write(png)
 
 
-def cmd_screen(b, out=None):
+def cmd_screen(b, out=None, quiet=False):
     out = out or time.strftime("screen-%H%M%S.png")
     b.send(CMD_SCREEN)
     _, status, data = b.reply()
@@ -340,7 +340,8 @@ def cmd_screen(b, out=None):
         row = buf[y * pitch * 4:(y * pitch + width) * 4]
         rows.append(bytes(v for i, v in enumerate(row) if i % 4 != 3))
     write_png(out, width, height, rows)
-    print(f"{out}: {width}x{height} (pitch {pitch}, format 0x{fmt:x}, pid 0x{pid:x})")
+    if not quiet:
+        print(f"{out}: {width}x{height} (pitch {pitch}, format 0x{fmt:x}, pid 0x{pid:x})")
 
 
 def cmd_input(b, args):
@@ -520,19 +521,25 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
             threads.append(cur)
         elif kind == "S" and cur is not None:
             parts = rest.split()
-            pc, lr, count = (int(parts[0], 16), int(parts[1], 16), int(parts[2])) if len(parts) == 3 else (int(parts[0], 16), 0, int(parts[1]))
-            cur["pcs"][(pc, lr)] = cur["pcs"].get((pc, lr), 0) + count
+            hexes, count = [int(v, 16) for v in parts[:-1]], int(parts[-1])
+            pc, lr, ra = (hexes + [0, 0, 0])[:3]
+            cur["pcs"][(pc, lr, ra)] = cur["pcs"].get((pc, lr, ra), 0) + count
     print(f"{rounds} rounds, {len(threads)} threads, modules known: {len(mm.mods)}")
     threads.sort(key=lambda t: -t["running"])
     cache = {}
 
     SYSTEM = ("SceLibKernel", "SceDriverUser", "SceLibc", "SceSysmem", "SceKernelThreadMgr")
 
-    def symbolize(pc, lr=0):
+    def symbolize(pc, lr=0, ra=0):
         name, off, elf, link = mm.locate(pc)
         # a sample inside a system library's stub belongs to the function that called it
         if lr and name is not None and name.startswith(SYSTEM):
             lname, _, _, _ = mm.locate(lr)
+            # lr in the stub as well: the return address the stub pushed on the stack
+            if ra and lname is not None and lname.startswith(SYSTEM):
+                rname, _, _, _ = mm.locate(ra)
+                if rname is not None and not rname.startswith(SYSTEM):
+                    return symbolize(ra) + f"  (in {name})"
             if lname is not None and not lname.startswith(SYSTEM):
                 return symbolize(lr) + f"  (in {name})"
         if name is None:
@@ -556,8 +563,8 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
         print(f"\n{t['name']} ({t['thid']}): on a core {pct_run:.0f}% of the time ({t['running']} of {t['samples']} samples), {t['overflow']} dropped")
         # aggregate by function (or address when unresolved)
         agg = {}
-        for (pc, lr), count in t["pcs"].items():
-            sym = symbolize(pc, lr)
+        for (pc, lr, ra), count in t["pcs"].items():
+            sym = symbolize(pc, lr, ra)
             agg[sym] = agg.get(sym, 0) + count
         for sym, count in sorted(agg.items(), key=lambda kv: -kv[1])[:12]:
             print(f"  {100.0 * count / max(t['running'], 1):5.1f}%  {sym}")
@@ -667,6 +674,19 @@ def main():
             sys.exit(f"kill: pid 0x{pid:x} is the shell, refused")
         check(status, "kill")
         print("asked the shell to close the running app" if pid == 0 else f"killed pid 0x{pid:x}")
+    elif cmd == "screen" and "--loop" in rest:
+        # keep capturing into the same file (default screen.png) at --fps (default 2) until ctrl-c
+        rest.remove("--loop")
+        fps = opt_int(rest, "--fps", 2)
+        out = rest[0] if rest else "screen.png"
+        print(f"capturing to {out} at {fps} fps (ctrl-c to stop)", file=sys.stderr)
+        try:
+            while True:
+                t0 = time.time()
+                cmd_screen(b, out, quiet=True)
+                time.sleep(max(0.0, 1.0 / fps - (time.time() - t0)))
+        except KeyboardInterrupt:
+            pass
     elif cmd == "screen" and len(rest) <= 1:
         cmd_screen(b, *rest)
     elif cmd == "input" and rest:

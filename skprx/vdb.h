@@ -39,9 +39,10 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.7.1"
+#define VDB_VERSION		"0.7.2"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
+#define VDB_AWAKE_FILE	VDB_DIR "awake"		// optional: "1" no standby, "2" no standby and no screen off, read at boot
 #define VDB_NOTE_FILE	VDB_DIR "boot.txt"
 
 #define RING_SIZE		( 64 * 1024 )
