@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.4.4"
+#define VDB_VERSION		"0.4.5"
 #define VDB_FLAG_FILE	"ux0:vdbplugin/usb_on"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -869,9 +869,9 @@ static void HandleCommand( unsigned char *pCmd, int nLen )
 	case VDB_CMD_STATUS:
 	{
 		// "rx N" is read by the host to size its command frames
-		int n = snprintf( (char *)ReplyPayload(), s_nDataChunk, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% %s, usb state 0x%x\n",
+		int n = snprintf( (char *)ReplyPayload(), s_nDataChunk, "vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x\n",
 			s_nRingWrite - s_nRingRead, RING_SIZE, s_nDropped, (unsigned)( ksceKernelGetSystemTimeWide() / 1000000 ), (int)s_PutFd, (unsigned)RX_SIZE,
-			kscePowerGetBatteryLifePercent(), kscePowerIsBatteryCharging() ? "charging" : "not charging", (unsigned)ksceUdcdGetDeviceState() );
+			kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), kscePowerIsBatteryCharging() ? "charging" : "not charging", (unsigned)ksceUdcdGetDeviceState() );
 		SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 		break;
 	}
@@ -1128,7 +1128,16 @@ static int UsbThread( SceSize args, void *argp )
 				// up: a Vita that locked itself went unreachable over USB
 				// more than once in the middle of a test session
 				if ( s_bActive )
+				{
 					ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
+					// repeat the charging request: ScePower's battery
+					// worker may drop it when the bus state changes
+					if ( bConnected && !kscePowerIsBatteryCharging() )
+					{
+						kscePowerBatterySetUsbStatus( SCE_POWER_BATTERY_USB_STATUS_CONFIGURED );
+						kscePowerBatteryEnableUsbCharging();
+					}
+				}
 			}
 			InputTick();
 			// Starting an app makes the system re-activate its own USB
