@@ -85,14 +85,16 @@ def open_device(interface):
     # after a re-enumeration (the Vita retakes the port after an app launch)
     # the device can sit unconfigured, and every bulk write then fails with an
     # I/O error: make sure configuration 1 is selected
+    # Only when none is active: a SET_CONFIGURATION makes the Vita run its
+    # attach path, which cancels every transfer in flight, the other
+    # process's log read included
     try:
-        cfg = dev.get_active_configuration()
-        configured = cfg is not None and cfg.bConfigurationValue == 1
+        configured = dev.get_active_configuration() is not None
     except usb.core.USBError:
         configured = False
     if not configured:
         try:
-            dev.set_configuration(1)
+            dev.set_configuration()
         except usb.core.USBError as e:
             print(f"set_configuration: {e}", file=sys.stderr)
     usb.util.claim_interface(dev, interface)

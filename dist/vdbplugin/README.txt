@@ -1,4 +1,4 @@
-vdb 0.6.10 (Vita debug bridge): streams a kernel log ring over USB and moves
+vdb 0.6.11 (Vita debug bridge): streams a kernel log ring over USB and moves
 files on any device (ux0:, ur0:, uma0:, vs0:, os0: ...) while a game runs.
 
 Install (firmware 3.65, HENkaku/Enso, taiHEN):

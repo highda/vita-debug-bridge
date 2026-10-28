@@ -6,6 +6,7 @@ SceUID g_Evf = -1;
 int g_bActive;
 int g_bHostAttached;
 static int s_bRegistered;
+static int s_bWantPort;	// the bridge should own the port (set by start, cleared by stop)
 
 // Buffers. The receive buffers (two, one request outstanding at a time:
 // when frame N has arrived in one, the next receive is queued into the
@@ -96,6 +97,15 @@ static int QueueReceive( int idx )
 		if ( r < 0 )
 		{
 			s_bRxOutstanding = 0;
+			if ( r == SCE_UDCD_ERROR_BUS_DRIVER_NOT_STARTED )
+			{
+				// the controller driver is down (a cable event, a reset from
+				// the host, an app launch): the port is gone, retrying is
+				// pointless; the thread's retake brings it back
+				FileNotef( "vdb: ReqRecv(%d): bus driver not started, port lost (uptime %u s)", idx, Uptime() );
+				g_bActive = 0;
+				return r;
+			}
 			if ( nTry == 0 || nTry == 49 )
 				FileNotef( "vdb: ReqRecv(%d) failed 0x%08x (try %d)", idx, r, nTry + 1 );
 		}
@@ -372,6 +382,7 @@ int vdb_usb_start( void )
 		return ret;
 	}
 	g_bActive = 1;
+	s_bWantPort = 1;
 	kscePowerBatteryEnableUsbCharging();
 	Log( "vdb: usb device active (pid 0x%04x)", VDB_USB_PID );
 	return 0;
@@ -379,6 +390,7 @@ int vdb_usb_start( void )
 
 int vdb_usb_stop( void )
 {
+	s_bWantPort = 0;
 	if ( !g_bActive )
 		return 0;
 	ksceKernelSetEventFlag( g_Evf, EVF_DISCONNECTED );
@@ -400,15 +412,17 @@ int vdb_usb_stop( void )
 // 0.4.2 did, retook the port every second: that flag is never set for it)
 void UsbRetakeIfLost( void )
 {
-	if ( !g_bActive )
+	if ( !s_bWantPort )
 		return;
 	int mtp = ksceUdcdGetDrvState( "USB_MTP_Driver" );
-	if ( !( mtp & SCE_UDCD_STATUS_ACTIVATED ) )
+	int bus = ksceUdcdGetDrvState( "USBDeviceControllerDriver" );
+	int bLost = !g_bActive || ( mtp & SCE_UDCD_STATUS_ACTIVATED ) || !( bus & SCE_UDCD_STATUS_DRIVER_STARTED );
+	if ( !bLost )
 		return;
 	g_bActive = 0;
 	g_bHostAttached = 0;
 	PutAbort();
 	int r = vdb_usb_start();
-	Log( "vdb: the system took the USB port (mtp state 0x%x), retaken: 0x%08x", mtp, r );
-	FileNotef( "vdb: port retaken after the system took it: 0x%08x (uptime %u s)", r, Uptime() );
+	Log( "vdb: the USB port was lost (mtp state 0x%x, bus 0x%x), retaken: 0x%08x", mtp, bus, r );
+	FileNotef( "vdb: port retaken (mtp 0x%x, bus 0x%x): 0x%08x (uptime %u s)", mtp, bus, r, Uptime() );
 }
