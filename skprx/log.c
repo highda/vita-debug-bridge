@@ -1,24 +1,38 @@
 // vdb: the log ring (what the host tails), boot notes, kernel printf capture
 #include "vdb.h"
+#include <psp2kern/kernel/cpu/spinlock.h>
 
 static char s_Ring[RING_SIZE];
 static unsigned s_nRingWrite, s_nRingRead;	// monotonic byte counters; valid = write - read
 static unsigned s_nDropped;
+// The ring is written from any thread on any of the three cores (and from
+// the kernel's printf, whatever context that runs in) and read by the USB
+// thread: a spinlock, not only interrupts off on the current core, which
+// is all 0.1 to 0.8.3 had
+static SceKernelSpinlock s_RingLock;
+
+// No wakeup from here: the kernel's printf calls in with scheduler or
+// other kernel locks held, and setting an event flag from such a context
+// can deadlock the kernel. The USB thread drains the ring on its 200 ms
+// tick anyway
+static void RingWriteQuiet( const char *pData, unsigned nLen )
+{
+	SceKernelIntrStatus intr = ksceKernelSpinlockLowLockCpuSuspendIntr( &s_RingLock );
+	unsigned nUsed = s_nRingWrite - s_nRingRead;
+	if ( nLen > RING_SIZE - nUsed )
+		s_nDropped += nLen;
+	else
+	{
+		for ( unsigned i = 0; i < nLen; i++ )
+			s_Ring[( s_nRingWrite + i ) % RING_SIZE] = pData[i];
+		s_nRingWrite += nLen;
+	}
+	ksceKernelSpinlockLowUnlockCpuResumeIntr( &s_RingLock, intr );
+}
 
 void RingWrite( const char *pData, unsigned nLen )
 {
-	int intr = ksceKernelCpuSuspendIntr();
-	unsigned nUsed = s_nRingWrite - s_nRingRead;
-	if ( nLen > RING_SIZE - nUsed )
-	{
-		s_nDropped += nLen;
-		ksceKernelCpuResumeIntr( intr );
-		return;
-	}
-	for ( unsigned i = 0; i < nLen; i++ )
-		s_Ring[( s_nRingWrite + i ) % RING_SIZE] = pData[i];
-	s_nRingWrite += nLen;
-	ksceKernelCpuResumeIntr( intr );
+	RingWriteQuiet( pData, nLen );
 	if ( g_Evf >= 0 )
 		ksceKernelSetEventFlag( g_Evf, EVF_DATA );
 }
@@ -26,13 +40,13 @@ void RingWrite( const char *pData, unsigned nLen )
 // bytes ready, copied into the transmit buffer (interrupts off for the copy)
 unsigned RingTake( unsigned char *pDest, unsigned nMax )
 {
-	int intr = ksceKernelCpuSuspendIntr();
+	SceKernelIntrStatus intr = ksceKernelSpinlockLowLockCpuSuspendIntr( &s_RingLock );
 	unsigned nUsed = s_nRingWrite - s_nRingRead;
 	unsigned n = nUsed < nMax ? nUsed : nMax;
 	for ( unsigned i = 0; i < n; i++ )
 		pDest[i] = s_Ring[( s_nRingRead + i ) % RING_SIZE];
 	s_nRingRead += n;
-	ksceKernelCpuResumeIntr( intr );
+	ksceKernelSpinlockLowUnlockCpuResumeIntr( &s_RingLock, intr );
 	return n;
 }
 
@@ -114,24 +128,31 @@ static volatile int s_bKprintf;
 static char s_KLine[200];
 static unsigned s_nKLine;
 
+static SceKernelSpinlock s_KLineLock;	// the line buffer, shared by every core that prints
+
 static int KPutchar( void *argp, char c )
 {
 	if ( !s_bKprintf )
 		return 0;
 	if ( c != '\n' && (unsigned char)c < 0x20 )
 		return 0;	// level bytes and carriage returns the kernel puts in front of its lines
+	SceKernelIntrStatus intr = ksceKernelSpinlockLowLockCpuSuspendIntr( &s_KLineLock );
 	if ( c != '\n' && s_nKLine < sizeof( s_KLine ) - 1 )
 	{
 		s_KLine[s_nKLine++] = c;
 		if ( s_nKLine < sizeof( s_KLine ) - 1 )
+		{
+			ksceKernelSpinlockLowUnlockCpuResumeIntr( &s_KLineLock, intr );
 			return 0;
+		}
 	}
-	// a full line, or the buffer is full: flush
+	// a full line, or the buffer is full: flush (quietly, see RingWriteQuiet)
 	static const char s_szPrefix[] = "[kernel] ";
-	RingWrite( s_szPrefix, sizeof( s_szPrefix ) - 1 );
-	RingWrite( s_KLine, s_nKLine );
-	RingWrite( "\n", 1 );
+	RingWriteQuiet( s_szPrefix, sizeof( s_szPrefix ) - 1 );
+	RingWriteQuiet( s_KLine, s_nKLine );
+	RingWriteQuiet( "\n", 1 );
 	s_nKLine = 0;
+	ksceKernelSpinlockLowUnlockCpuResumeIntr( &s_KLineLock, intr );
 	return 0;
 }
 

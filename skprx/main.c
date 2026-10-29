@@ -175,9 +175,21 @@ int module_start( SceSize argc, const void *args )
 		ksceKernelDeleteEventFlag( g_Evf );
 		return SCE_KERNEL_START_FAILED;
 	}
-	InstallInputHooks();
-	InstallDisplayHook();
-	InstallKprintfCapture();
+	// ux0:vdbplugin/nohooks: the bridge without any hook in other code paths
+	// (touch readers, the display, the kernel's printf), to tell a conflict
+	// with a game or another plugin apart from the USB side
+	SceUID fdNoHooks = ksceIoOpen( VDB_NOHOOKS_FILE, SCE_O_RDONLY, 0 );
+	if ( fdNoHooks >= 0 )
+	{
+		ksceIoClose( fdNoHooks );
+		FileNote( "vdb: nohooks flag: touch, display and printf hooks not installed\n" );
+	}
+	else
+	{
+		InstallInputHooks();
+		InstallDisplayHook();
+		InstallKprintfCapture();
+	}
 	UsbInstallSuspendHandler();
 
 	// decide the auto start before the thread runs (it once read the flag

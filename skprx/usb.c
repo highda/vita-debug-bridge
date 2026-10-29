@@ -20,7 +20,15 @@ static int s_bWantPort;	// the bridge should own the port (set by start, cleared
 // one request object, reused
 #define RX_BUFS 2
 static unsigned char s_TxBuf[CHUNK_SIZE] __attribute__(( aligned( 64 ) ));		// log chunks, EP1 (small, static has worked throughout)
-static unsigned char s_RxBufStatic[RX_SIZE] __attribute__(( aligned( 64 ) ));	// fallback when the block cannot be allocated
+// Fallback when the block cannot be allocated: 4 KB frames (the host reads
+// the size from the status line). A 256 KB static fallback, plus the block
+// allocated at load and the profiler's tables, kept 1.9 MB of kernel memory
+// busy from boot: Borderlands 2 took the whole Vita down while starting its
+// audio engine with vdb merely loaded. Everything big is now allocated when
+// it is first used
+static unsigned char s_RxBufStatic[4096] __attribute__(( aligned( 64 ) ));
+static unsigned s_nRxSize = sizeof( s_RxBufStatic );
+static int s_bAllocTried;
 static unsigned char s_DataBufStatic[sizeof( VdbRspHdr_t ) + 4096] __attribute__(( aligned( 64 ) ));
 static unsigned char *s_pRxBuf[RX_BUFS] = { s_RxBufStatic, s_RxBufStatic };
 static int s_nRxBufs = 1;
@@ -79,7 +87,7 @@ static int QueueReceive( int idx )
 	// of the buffer before the transfer (and again after it), or the CPU
 	// re-reads the previous command. Seen on hardware: the first command
 	// worked, every later one re-ran the old one with a garbage path
-	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
+	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], s_nRxSize );
 	SceUdcdDeviceRequest *pReq = &s_RxReq[idx];
 	int r = -1;
 	// right after an attach the cancel of the previous request can still
@@ -92,7 +100,7 @@ static int QueueReceive( int idx )
 		memset( pReq, 0, sizeof( *pReq ) );
 		pReq->endpoint = &endpoints[VDB_EP_OUT];
 		pReq->data = s_pRxBuf[idx];
-		pReq->size = RX_SIZE;
+		pReq->size = s_nRxSize;
 		pReq->onComplete = OnReceived;
 		s_nRxQueuedIdx = idx;
 		s_bRxOutstanding = 1;
@@ -141,7 +149,7 @@ int UsbTakeFrame( unsigned char **ppFrame )
 	int nLen = s_RxReq[idx].returnCode < 0 ? 0 : s_RxReq[idx].transmitted;
 	s_nRxProcessed = s_nRxCompleted;
 	QueueReceive( ( idx + 1 ) % s_nRxBufs );
-	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], RX_SIZE );
+	ksceKernelDcacheInvalidateRange( s_pRxBuf[idx], s_nRxSize );
 	*ppFrame = s_pRxBuf[idx];
 	return nLen;
 }
@@ -483,7 +491,21 @@ int UsbRegister( void )
 	if ( r < 0 )
 		return r;
 	s_bRegistered = 1;
+	return 0;
+}
 
+unsigned UsbRxSize( void )
+{
+	return s_nRxSize;
+}
+
+// The DMA buffers, on the first start of the bridge (not at load: a vdb
+// that never takes the port holds no contiguous memory)
+static void UsbAllocBuffers( void )
+{
+	if ( s_bAllocTried )
+		return;
+	s_bAllocTried = 1;
 	SceKernelAllocMemBlockKernelOpt opt;
 	memset( &opt, 0, sizeof( opt ) );
 	opt.size = sizeof( opt );
@@ -499,9 +521,9 @@ int UsbRegister( void )
 		s_nRxBufs = RX_BUFS;
 		s_DataBuf = (unsigned char *)pBase + RX_BUFS * RX_SIZE;
 		s_nDataChunk = DATA_CHUNK;
+		s_nRxSize = RX_SIZE;
 	}
-	FileNotef( "vdb: usb buffers: block 0x%08x base %p, %d receive buffers", (unsigned)s_Block, pBase, s_nRxBufs );
-	return 0;
+	FileNotef( "vdb: usb buffers: block 0x%08x base %p, %d receive buffers of %u bytes", (unsigned)s_Block, pBase, s_nRxBufs, s_nRxSize );
 }
 
 void UsbUnregister( void )
@@ -520,6 +542,7 @@ int vdb_usb_start( void )
 		return -1;
 	if ( g_bActive )
 		return 0;
+	UsbAllocBuffers();
 	ret = ksceUdcdDeactivate();
 	FileNotef( "vdb: deactivate 0x%08x", ret );
 	if ( ret < 0 && ret != SCE_UDCD_ERROR_INVALID_ARGUMENT )

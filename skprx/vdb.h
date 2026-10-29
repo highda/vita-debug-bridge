@@ -39,10 +39,11 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.8.3"
+#define VDB_VERSION		"0.8.5"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_AWAKE_FILE	VDB_DIR "awake"		// optional: "1" no standby, "2" no standby and no screen off, read at boot
+#define VDB_NOHOOKS_FILE	VDB_DIR "nohooks"	// optional: no touch, display or printf hooks (the USB bridge only), read at boot
 #define VDB_NOTE_FILE	VDB_DIR "boot.txt"
 
 #define RING_SIZE		( 64 * 1024 )
@@ -159,7 +160,8 @@ int KprintfCapturing( void );
 extern SceUID g_Evf;
 extern int g_bActive;				// the bridge owns the USB port
 extern int g_bHostAttached;			// a host configured the device (set by the thread)
-int UsbRegister( void );				// driver registration and DMA buffers, from module_start
+int UsbRegister( void );
+unsigned UsbRxSize( void );				// the command frame size the host may send (RX_SIZE, or 4 KB without the DMA block)				// driver registration and DMA buffers, from module_start
 void UsbUnregister( void );
 void UsbStartReceiving( void );			// after a host attached
 void UsbWatchdog( void );				// from the thread tick: a receive must be outstanding while a host is attached

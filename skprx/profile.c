@@ -104,7 +104,9 @@ typedef struct
 	ProfBucket_t buckets[PROF_BUCKETS];
 } ProfThread_t;
 
-static ProfThread_t s_Prof[PROF_THREADS];
+// about 1 MB: allocated when a profile first starts, not at load (see usb.c)
+static ProfThread_t *s_Prof;
+static SceUID s_ProfBlock = -1;
 static int s_nProfThreads;
 static SceUID s_ProfPid = -1, s_ProfThread = -1;
 static volatile int s_bProfRun;
@@ -348,6 +350,18 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		unsigned pid, us;
 		memcpy( &pid, pPayload, 4 );
 		memcpy( &us, pPayload + 4, 4 );
+		if ( !s_Prof )
+		{
+			unsigned nBytes = ( sizeof( ProfThread_t ) * PROF_THREADS + 0xFFF ) & ~0xFFFu;
+			s_ProfBlock = ksceKernelAllocMemBlock( "vdb_prof", 0x1020D006, nBytes, NULL );
+			void *pBase = NULL;
+			if ( s_ProfBlock < 0 || ksceKernelGetMemBlockBase( s_ProfBlock, &pBase ) < 0 || !pBase )
+			{
+				SendReply( VDB_CMD_PROFILE, s_ProfBlock < 0 ? s_ProfBlock : -1, 0 );
+				return;
+			}
+			s_Prof = (ProfThread_t *)pBase;
+		}
 		s_ProfPid = pid ? (SceUID)pid : ScreenOwnerPid();
 		// never the kernel: suspending its threads (this plugin's USB
 		// thread among them) would hang the Vita
@@ -386,7 +400,7 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 	unsigned nUsed = 0;
 	if ( Emit( VDB_CMD_PROFILE, &nUsed, "R %u %u 0x%08x %u\n", s_nProfRounds, s_nProfInterval, (unsigned)s_ProfPid, (unsigned)( s_nProfEndUs - s_nProfStartUs ) ) < 0 )
 		return;
-	for ( int t = 0; t < s_nProfThreads; t++ )
+	for ( int t = 0; s_Prof && t < s_nProfThreads; t++ )
 	{
 		ProfThread_t *p = &s_Prof[t];
 		if ( Emit( VDB_CMD_PROFILE, &nUsed, "T 0x%08x %u %u %u %u %s\n", (unsigned)p->thid, p->nSamples, p->nRunning, p->nOverflow, (unsigned)( p->nRunUs1 - p->nRunUs0 ), p->name ) < 0 )

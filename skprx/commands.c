@@ -463,7 +463,7 @@ static void CmdStatus( void )
 	// "rx N" is read by the host to size its command frames
 	int n = snprintf( (char *)ReplyPayload(), ReplyCapacity(),
 		"vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x, awake %d, kprintf %s, system writes %s\n",
-		RingUsed(), RING_SIZE, RingDropped(), Uptime(), (int)s_PutFd, (unsigned)RX_SIZE,
+		RingUsed(), RING_SIZE, RingDropped(), Uptime(), (int)s_PutFd, UsbRxSize(),
 		kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), ChargingText(),
 		(unsigned)ksceUdcdGetDeviceState(), g_nAwakeMode, KprintfCapturing() ? "on" : "off", SystemWritesSecondsLeft() ? "unlocked" : "locked" );
 	SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
@@ -518,10 +518,10 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 	if ( hdr.len < nPayload )
 		nPayload = hdr.len;	// the rest is padding
 	// paths: force termination inside the buffer
-	if ( hdr.cmd != VDB_CMD_PUT_DATA && nPayload < RX_SIZE - sizeof( hdr ) )
+	if ( hdr.cmd != VDB_CMD_PUT_DATA && nPayload < UsbRxSize() - sizeof( hdr ) )
 		pPayload[nPayload] = 0;
 	else if ( hdr.cmd != VDB_CMD_PUT_DATA )
-		pPayload[RX_SIZE - sizeof( hdr ) - 1] = 0;
+		pPayload[UsbRxSize() - sizeof( hdr ) - 1] = 0;
 	const char *pszPath = (const char *)pPayload;
 
 	switch ( hdr.cmd )
