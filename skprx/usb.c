@@ -155,6 +155,41 @@ void UsbWatchdog( void )
 	// 0.7.1 to 0.7.4 then waited for an attach forever and the bridge sat
 	// deaf until the host reset it. Back to "established" and not suspended
 	// after such a failure: the same path as an attach
+	// A bus that stays "suspended" after a failed receive while the host
+	// keeps writing (I/O errors on the Mac, only a host-side reset helped):
+	// reproduced by a host reset with a second process reading the logs,
+	// and twice in 30 minutes of the stress test. Who suspended it is not
+	// known (the Mac logs nothing). After three seconds of it, cable in and
+	// not in the Vita's own standby, the device is disconnected and
+	// connected again once, so the host enumerates it afresh. Once per
+	// episode: a Mac that is really asleep gets one reconnect, no more
+	{
+		static unsigned s_nSuspSince;
+		static int s_bReconnected;
+		unsigned st = (unsigned)ksceUdcdGetDeviceState();
+		if ( s_bLostByRecv && g_bActive && !g_bHostAttached && !UsbSuspended()
+			&& ( st & SCE_UDCD_STATUS_CONNECTION_SUSPENDED ) && ( st & SCE_UDCD_STATUS_CABLE_CONNECTED ) )
+		{
+			if ( !s_nSuspSince )
+				s_nSuspSince = Uptime();
+			else if ( !s_bReconnected && Uptime() - s_nSuspSince >= 3 )
+			{
+				s_bReconnected = 1;
+				int d = ksceUdcdDeactivate();
+				ksceKernelDelayThread( 200 * 1000 );
+				ksceKernelClearEventFlag( g_Evf, ~EVF_ALL );
+				int a = ksceUdcdActivate( VDB_USB_PID );
+				FileNotef( "vdb: bus suspended 3 s after a failed receive (usb state 0x%x), device reconnected: deactivate 0x%08x activate 0x%08x (uptime %u s)", st, d, a, Uptime() );
+				Log( "vdb: stuck bus suspend, device reconnected (0x%08x 0x%08x)", d, a );
+			}
+		}
+		else
+		{
+			s_nSuspSince = 0;
+			if ( !( st & SCE_UDCD_STATUS_CONNECTION_SUSPENDED ) )
+				s_bReconnected = 0;
+		}
+	}
 	if ( s_bLostByRecv && g_bActive && !g_bHostAttached )
 	{
 		// (not when the system's own device took the port: an app's exit
@@ -172,10 +207,27 @@ void UsbWatchdog( void )
 		}
 	}
 	// (a completion of a cancelled, older request may have bumped the
-	// counters: what matters is only that nothing is outstanding now)
-	if ( g_bHostAttached && g_bActive && !s_bRxOutstanding )
+	// counters: what matters is only that nothing is outstanding now.)
+	// Only when the state has held since the previous tick: a receive that
+	// completed an instant ago also leaves nothing outstanding until the
+	// loop takes its frame, and acting then threw the frame away. The
+	// stress test hit it with every profile, whose "stop" comes exactly one
+	// second (five ticks) after "start": one in twenty was lost
+	static unsigned s_nSeenCompleted = 0xFFFFFFFF;
+	if ( !( g_bHostAttached && g_bActive && !s_bRxOutstanding ) )
 	{
-		FileNotef( "vdb: no receive outstanding, queued again (uptime %u s)", Uptime() );
+		s_nSeenCompleted = 0xFFFFFFFF;
+		return;
+	}
+	if ( s_nSeenCompleted != s_nRxCompleted )
+	{
+		s_nSeenCompleted = s_nRxCompleted;	// look again at the next tick
+		return;
+	}
+	s_nSeenCompleted = 0xFFFFFFFF;
+	{
+		FileNotef( "vdb: no receive outstanding, queued again (uptime %u s; completed %u processed %u idx %d; req0 rc %d len %d, req1 rc %d len %d)", Uptime(),
+			s_nRxCompleted, s_nRxProcessed, s_nRxQueuedIdx, s_RxReq[0].returnCode, s_RxReq[0].transmitted, s_RxReq[1].returnCode, s_RxReq[1].transmitted );
 		s_nRxProcessed = s_nRxCompleted;
 		QueueReceive( ( s_nRxQueuedIdx + 1 ) % s_nRxBufs );
 	}
@@ -214,12 +266,23 @@ int SendReply( unsigned nCmd, int nStatus, unsigned nLen )
 	pHdr->cmd = nCmd;
 	pHdr->status = nStatus;
 	pHdr->len = nLen;
+	// A transfer that is an exact multiple of the packet size (512 at high
+	// speed, 64 at full speed) has no short packet to end it: the host's
+	// read waits on, and the next reply runs into the same read. Found by
+	// the stress test: a 262128-byte file ended in a 65536-byte frame, the
+	// closing empty frame was swallowed and the host timed out; a listing
+	// or dump could lose a frame the same way. One pad byte past the
+	// header's length ends the transfer (the host reads len, as the plugin
+	// does with the host's own padded frames). The buffers have room for it
+	unsigned nTotal = sizeof( VdbRspHdr_t ) + nLen;
+	if ( ( nTotal & 63 ) == 0 )
+		s_DataBuf[nTotal++] = 0;
 	ksceKernelClearEventFlag( g_Evf, ~EVF_DSENT );
-	ksceKernelDcacheCleanRange( s_DataBuf, sizeof( VdbRspHdr_t ) + nLen );
+	ksceKernelDcacheCleanRange( s_DataBuf, nTotal );
 	memset( &s_DataReq, 0, sizeof( s_DataReq ) );
 	s_DataReq.endpoint = &endpoints[VDB_EP_DATA];
 	s_DataReq.data = s_DataBuf;
-	s_DataReq.size = sizeof( VdbRspHdr_t ) + nLen;
+	s_DataReq.size = nTotal;
 	s_DataReq.onComplete = OnDataSent;
 	int ret = ksceUdcdReqSend( &s_DataReq );
 	if ( ret < 0 )

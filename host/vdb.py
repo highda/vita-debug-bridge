@@ -87,7 +87,7 @@ DATA_CHUNK = 1024 * 1024       # largest reply frame any plugin version sends (0
 TIMEOUT = 5000
 
 
-def open_device(interface):
+def open_device(interface, may_configure=True):
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if dev is None:
         sys.exit("no vdb device (Vita not connected, plugin idle, or usb_on flag missing)")
@@ -102,6 +102,13 @@ def open_device(interface):
     except usb.core.USBError:
         configured = False
     if not configured:
+        # The log tail leaves this to the command side: on macOS the process
+        # that selects the configuration can keep the device to itself, and
+        # every other process's claim is then refused ("access denied")
+        # until it lets go. The stress test hit it after app cycles and
+        # resets whenever the recorder was quicker
+        if not may_configure:
+            raise usb.core.USBError("not configured yet")
         try:
             dev.set_configuration()
         except usb.core.USBError as e:
@@ -113,7 +120,28 @@ def open_device(interface):
 class Bridge:
     """Command side: interface 1, EP2 out, EP3 in."""
 
-    def __init__(self):
+    def __init__(self, heal=True):
+        try:
+            self._open()
+        except (usb.core.USBError, IOError) as e:
+            # a port stuck in a suspend only one side knows about answers
+            # every transfer with an I/O error; a reset makes the Vita
+            # enumerate afresh (the plugin also reconnects by itself after
+            # a few seconds)
+            if not heal or getattr(e, "errno", None) not in (5, 13, 60):
+                raise
+            print(f"vdb: the port answers with errors ({e}), resetting it", file=sys.stderr)
+            if getattr(self, "dev", None) is not None:
+                try:  # a half-open handle keeps interface 1 claimed: the retry would be refused
+                    usb.util.dispose_resources(self.dev)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.dev = None
+            reset_device()
+            time.sleep(2)
+            self._open()
+
+    def _open(self):
         self.dev = open_device(1)
         cfg = self.dev.get_active_configuration()
         ep = usb.util.find_descriptor(cfg[(1, 0)], bEndpointAddress=EP_OUT)
@@ -155,11 +183,39 @@ class Bridge:
         return status, data
 
 
+def reset_device():
+    """USB reset of the vdb device; False when it is not on the bus. pyusb
+    reports "no such device" when the reset works (the device enumerates
+    again under it), so that is not an error."""
+    dev = usb.core.find(idVendor=VID, idProduct=PID)
+    if dev is None:
+        return False
+    try:
+        dev.reset()
+    except usb.core.USBError as e:
+        if getattr(e, "errno", None) != 19:
+            raise
+    finally:
+        try:
+            usb.util.dispose_resources(dev)
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
 def path_arg(p):
     return p.encode("utf-8") + b"\0"
 
 
+ERR_LOCKED, ERR_NOT_USER = -7, -8
+
+
 def check(status, what):
+    if status == ERR_LOCKED:
+        sys.exit(f"{what}: refused, writes outside ux0:/uma0:/imc0:/xmc0: are locked; "
+                 "press L + R + Start + Down on the Vita to allow them for 2 minutes")
+    if status == ERR_NOT_USER:
+        sys.exit(f"{what}: refused, only user processes (not the kernel)")
     if status < 0:
         sys.exit(f"{what}: error 0x{status & 0xFFFFFFFF:08x}")
 
@@ -171,6 +227,7 @@ def logs(stamp=False, path=None):
     dev = None
     buf = b""
     out = open(path, "a") if path else None
+    last_data = time.time()
 
     def emit(line):
         if stamp:
@@ -183,16 +240,30 @@ def logs(stamp=False, path=None):
         if dev is None:
             while usb.core.find(idVendor=VID, idProduct=PID) is None:
                 time.sleep(1)
+            time.sleep(2)  # a command client, if one is waiting, goes first
             try:
-                dev = open_device(0)
+                dev = open_device(0, may_configure=False)
             except (usb.core.USBError, SystemExit):
                 time.sleep(1)
                 continue
             buf = b""
+            last_data = time.time()
             print(f"vdb: attached {time.strftime('%H:%M:%S')}, waiting for log data (ctrl-c to stop)", file=sys.stderr)
         try:
             data = dev.read(EP_IN, 4096, timeout=2000)
+            last_data = time.time()
         except usb.core.USBTimeoutError:
+            # The plugin writes a heartbeat every 5 s while a host is
+            # attached: 12 s of silence means this handle belongs to a device
+            # that has since enumerated again (a reset, a retake). Holding it
+            # made macOS refuse every other process ("no such device") until
+            # the tail was stopped. Let it go and open the device afresh
+            if time.time() - last_data > 12:
+                try:
+                    usb.util.dispose_resources(dev)
+                except Exception:  # noqa: BLE001
+                    pass
+                dev = None
             continue
         except usb.core.USBError as e:
             print(f"vdb: usb error ({e}), waiting for the Vita to come back", file=sys.stderr)
@@ -380,7 +451,7 @@ def cmd_touch(b, x0, y0, x1, y1, ms, what, back=False):
 def opt_int(args, name, default):
     if name in args:
         i = args.index(name)
-        v = int(args[i + 1])
+        v = int(args[i + 1], 0)
         del args[i:i + 2]
         return v
     return default
@@ -628,13 +699,8 @@ def main():
         return 1
     cmd, rest = args[0], args[1:]
     if cmd == "reset":
-        dev = usb.core.find(idVendor=VID, idProduct=PID)
-        if dev is None:
+        if not reset_device():
             sys.exit("no vdb device on the bus")
-        try:
-            dev.reset()
-        except usb.core.USBError as e:
-            sys.exit(f"reset failed: {e} (another process holding the device, such as a running `logs`?)")
         time.sleep(2)
         print("reset done; the Vita re-attaches and queues a fresh receive")
         return 0

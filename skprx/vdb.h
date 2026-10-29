@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.7.8"
+#define VDB_VERSION		"0.8.3"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_AWAKE_FILE	VDB_DIR "awake"		// optional: "1" no standby, "2" no standby and no screen off, read at boot
@@ -186,6 +186,17 @@ int vdb_usb_stop( void );
 // commands.c: the host protocol
 //-----------------------------------------------------------------------------
 void HandleCommand( unsigned char *pCmd, int nLen );
+// Safety. File writes outside the user storage devices (ux0:, uma0:,
+// imc0:, xmc0:) are refused (VDB_ERR_LOCKED) unless unlocked on the Vita
+// itself, L+R+Start+Down, for VDB_UNLOCK_SECONDS; process commands only
+// accept user processes (never the kernel's)
+#define VDB_ERR_LOCKED		-7
+#define VDB_ERR_NOT_USER	-8
+#define VDB_UNLOCK_SECONDS	120
+void SystemWritesUnlock( void );			// from the hotkey
+void SystemWritesTick( void );				// thread tick: relocks at the deadline
+unsigned SystemWritesSecondsLeft( void );	// 0 when locked
+int UserPid( SceUID pid );					// a user process, not the kernel
 void PutAbort( void );
 
 //-----------------------------------------------------------------------------

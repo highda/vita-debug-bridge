@@ -14,8 +14,8 @@ void StatusOsdTick( void )
 		return;
 	s_nLast = Uptime();
 	char text[6 * 64];
-	int n = snprintf( text, sizeof( text ), "vdb " VDB_VERSION " up %us batt %d%% %dmAh chg %d awake %d ring %u/%u\n",
-		Uptime(), kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), kscePowerGetBatteryChargingStatus(), g_nAwakeMode, RingUsed(), RING_SIZE );
+	int n = snprintf( text, sizeof( text ), "vdb " VDB_VERSION " up %us batt %d%% %dmAh chg %d awake %d ring %u/%u sysw %us\n",
+		Uptime(), kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), kscePowerGetBatteryChargingStatus(), g_nAwakeMode, RingUsed(), RING_SIZE, SystemWritesSecondsLeft() );
 	if ( n > 0 && n < (int)sizeof( text ) )
 		UsbStatusLines( text + n, sizeof( text ) - n );
 	OsdSet( text );
@@ -34,7 +34,7 @@ static void Hotkeys( unsigned *pnPrevButtons )
 	if ( ksceCtrlPeekBufferPositive( 0, &pad, 1 ) <= 0 )
 		return;
 	const unsigned nCombo = SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER | SCE_CTRL_START;
-	const unsigned nToggle = nCombo | SCE_CTRL_SELECT, nStatus = nCombo | SCE_CTRL_UP;
+	const unsigned nToggle = nCombo | SCE_CTRL_SELECT, nStatus = nCombo | SCE_CTRL_UP, nUnlock = nCombo | SCE_CTRL_DOWN;
 	unsigned nNow = pad.buttons, nPrev = *pnPrevButtons;
 	*pnPrevButtons = nNow;
 	if ( ( nNow & nToggle ) == nToggle && ( nPrev & nToggle ) != nToggle )
@@ -44,6 +44,8 @@ static void Hotkeys( unsigned *pnPrevButtons )
 		FileNotef( "vdb: hotkey %s: 0x%08x (uptime %u s)", g_bActive ? "bridge on" : "bridge off", r, Uptime() );
 		Log( "vdb: hotkey %s: 0x%08x", g_bActive ? "bridge on" : "bridge off", r );
 	}
+	else if ( ( nNow & nUnlock ) == nUnlock && ( nPrev & nUnlock ) != nUnlock )
+		SystemWritesUnlock();
 	else if ( ( nNow & nStatus ) == nStatus && ( nPrev & nStatus ) != nStatus )
 	{
 		// toggles the status overlay and leaves a note either way
@@ -113,6 +115,7 @@ static int UsbThread( SceSize args, void *argp )
 			}
 			InputTick();
 			UsbSuspendTick();
+			SystemWritesTick();
 			UsbWatchdog();
 			StatusOsdTick();
 			if ( nTicks % 5 == 0 )

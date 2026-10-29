@@ -5,6 +5,89 @@
 // Files, on the kernel's own IO: every mounted device is reachable
 //-----------------------------------------------------------------------------
 static SceUID s_PutFd = -1;			// file being written by PUT_OPEN .. PUT_CLOSE
+
+//-----------------------------------------------------------------------------
+// Safety: what the host may change without someone at the Vita. The USB
+// port is a privileged channel (whoever holds the cable reads and writes
+// files and process memory), so the parts that can stop the Vita from
+// booting are behind a physical unlock: writes outside the user storage
+// devices need L+R+Start+Down on the Vita, which opens them for two
+// minutes. Reads stay free, the firmware partitions refuse writes anyway
+//-----------------------------------------------------------------------------
+static unsigned s_nUnlockUntil;	// Uptime() deadline, 0 = locked
+static int s_bUnlockOsd;
+
+void SystemWritesUnlock( void )
+{
+	s_nUnlockUntil = Uptime() + VDB_UNLOCK_SECONDS;
+	FileNotef( "vdb: system partition writes unlocked on the Vita for %u s (uptime %u s)", VDB_UNLOCK_SECONDS, Uptime() );
+	Log( "vdb: system partition writes unlocked on the Vita for %u s", VDB_UNLOCK_SECONDS );
+	if ( !g_bStatusOsd && OsdAvailable() )
+	{
+		OsdSet( "vdb: system partitions writable for 2 minutes" );
+		s_bUnlockOsd = 1;
+	}
+}
+
+unsigned SystemWritesSecondsLeft( void )
+{
+	unsigned now = Uptime();
+	return s_nUnlockUntil > now ? s_nUnlockUntil - now : 0;
+}
+
+void SystemWritesTick( void )
+{
+	if ( s_nUnlockUntil && !SystemWritesSecondsLeft() )
+	{
+		s_nUnlockUntil = 0;
+		Log( "vdb: system partition writes locked again" );
+		if ( s_bUnlockOsd && !g_bStatusOsd )
+			OsdSet( "" );
+		s_bUnlockOsd = 0;
+	}
+}
+
+// The device of a path ("ux0" of "ux0:data/x"), case-insensitive
+static int PathOnUserStorage( const char *pszPath )
+{
+	static const char *s_pszFree[] = { "ux0", "uma0", "imc0", "xmc0" };
+	const char *pColon = strchr( pszPath, ':' );
+	if ( !pColon )
+		return 0;
+	unsigned n = pColon - pszPath;
+	for ( unsigned i = 0; i < sizeof( s_pszFree ) / sizeof( s_pszFree[0] ); i++ )
+	{
+		const char *f = s_pszFree[i];
+		if ( strlen( f ) != n )
+			continue;
+		unsigned k = 0;
+		for ( ; k < n; k++ )
+		{
+			char c = pszPath[k];
+			if ( c >= 'A' && c <= 'Z' )
+				c += 'a' - 'A';
+			if ( c != f[k] )
+				break;
+		}
+		if ( k == n )
+			return 1;
+	}
+	return 0;
+}
+
+static int WriteAllowed( unsigned nCmd, const char *pszPath )
+{
+	if ( PathOnUserStorage( pszPath ) || SystemWritesSecondsLeft() )
+		return 1;
+	Log( "vdb: write refused (system partitions locked, L+R+Start+Down on the Vita unlocks): %s", pszPath );
+	SendReply( nCmd, VDB_ERR_LOCKED, 0 );
+	return 0;
+}
+
+int UserPid( SceUID pid )
+{
+	return pid > 0 && pid != KERNEL_PID;
+}
 static int s_nPutError;
 static unsigned long long s_nPutBytes;
 
@@ -129,8 +212,9 @@ static void CmdPutOpen( const char *pszPath )
 	PutAbort();
 	s_nPutError = 0;
 	s_nPutBytes = 0;
-	s_PutFd = ksceIoOpen( pszPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777 );
-	SendReply( VDB_CMD_PUT_OPEN, s_PutFd < 0 ? s_PutFd : 0, 0 );
+	SceUID fd = ksceIoOpen( pszPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777 );
+	s_PutFd = fd < 0 ? -1 : fd;	// (an error code here read as a handle in the status line)
+	SendReply( VDB_CMD_PUT_OPEN, fd < 0 ? fd : 0, 0 );
 }
 
 static void CmdPutData( const unsigned char *pData, unsigned nLen )
@@ -239,9 +323,9 @@ static void CmdPeek( SceUID pid, const unsigned char *pPayload, unsigned nPayloa
 	memcpy( &nLen, pPayload + 4, 4 );
 	if ( pid == 0 )
 		pid = ScreenOwnerPid();
-	if ( pid < 0 || nLen > 64 * 1024 * 1024 )
+	if ( !UserPid( pid ) || nLen > 64 * 1024 * 1024 || nAddr + nLen < nAddr )
 	{
-		SendReply( VDB_CMD_PEEK, pid < 0 ? pid : -2, 0 );
+		SendReply( VDB_CMD_PEEK, pid < 0 ? pid : !UserPid( pid ) ? VDB_ERR_NOT_USER : -2, 0 );
 		return;
 	}
 	unsigned nDone = 0;
@@ -276,12 +360,12 @@ static void CmdPoke( SceUID pid, const unsigned char *pPayload, unsigned nPayloa
 	memcpy( &nAddr, pPayload, 4 );
 	if ( pid == 0 )
 		pid = ScreenOwnerPid();
-	if ( pid < 0 )
+	unsigned nLen = nPayload - 4;
+	if ( !UserPid( pid ) || nAddr + nLen < nAddr )
 	{
-		SendReply( VDB_CMD_POKE, pid, 0 );
+		SendReply( VDB_CMD_POKE, pid < 0 ? pid : !UserPid( pid ) ? VDB_ERR_NOT_USER : -2, 0 );
 		return;
 	}
-	unsigned nLen = nPayload - 4;
 	int r = ksceKernelCopyToUserProc( pid, (void *)nAddr, pPayload + 4, nLen );
 	unsigned nWritten = r < 0 ? 0 : nLen;
 	Log( "vdb: poke pid 0x%08x addr 0x%08x %u bytes: 0x%08x", pid, nAddr, nLen, r );
@@ -378,10 +462,10 @@ static void CmdStatus( void )
 {
 	// "rx N" is read by the host to size its command frames
 	int n = snprintf( (char *)ReplyPayload(), ReplyCapacity(),
-		"vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x, awake %d, kprintf %s\n",
+		"vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x, awake %d, kprintf %s, system writes %s\n",
 		RingUsed(), RING_SIZE, RingDropped(), Uptime(), (int)s_PutFd, (unsigned)RX_SIZE,
 		kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), ChargingText(),
-		(unsigned)ksceUdcdGetDeviceState(), g_nAwakeMode, KprintfCapturing() ? "on" : "off" );
+		(unsigned)ksceUdcdGetDeviceState(), g_nAwakeMode, KprintfCapturing() ? "on" : "off", SystemWritesSecondsLeft() ? "unlocked" : "locked" );
 	SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 }
 
@@ -458,7 +542,10 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 		CmdGet( pszPath );
 		break;
 	case VDB_CMD_PUT_OPEN:
-		CmdPutOpen( pszPath );
+		if ( WriteAllowed( VDB_CMD_PUT_OPEN, pszPath ) )
+			CmdPutOpen( pszPath );
+		else
+			PutAbort();	// the data frames that follow go nowhere
 		break;
 	case VDB_CMD_PUT_DATA:
 		CmdPutData( pPayload, nPayload );
@@ -467,19 +554,26 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 		CmdPutClose();
 		break;
 	case VDB_CMD_MKDIR:
-		SendReply( VDB_CMD_MKDIR, ksceIoMkdir( pszPath, 0777 ), 0 );
+		if ( WriteAllowed( VDB_CMD_MKDIR, pszPath ) )
+			SendReply( VDB_CMD_MKDIR, ksceIoMkdir( pszPath, 0777 ), 0 );
 		break;
 	case VDB_CMD_REMOVE:
-		SendReply( VDB_CMD_REMOVE, ksceIoRemove( pszPath ), 0 );
+		if ( WriteAllowed( VDB_CMD_REMOVE, pszPath ) )
+			SendReply( VDB_CMD_REMOVE, ksceIoRemove( pszPath ), 0 );
 		break;
 	case VDB_CMD_RMDIR:
-		SendReply( VDB_CMD_RMDIR, ksceIoRmdir( pszPath ), 0 );
+		if ( WriteAllowed( VDB_CMD_RMDIR, pszPath ) )
+			SendReply( VDB_CMD_RMDIR, ksceIoRmdir( pszPath ), 0 );
 		break;
 	case VDB_CMD_RENAME:
 	{
 		unsigned nFirst = strlen( pszPath );
 		const char *pszNew = nFirst + 1 < nPayload ? pszPath + nFirst + 1 : "";
-		SendReply( VDB_CMD_RENAME, ksceIoRename( pszPath, pszNew ), 0 );
+		// both ends: a move out of a system partition removes from it
+		if ( !PathOnUserStorage( pszPath ) && !SystemWritesSecondsLeft() )
+			WriteAllowed( VDB_CMD_RENAME, pszPath );
+		else if ( WriteAllowed( VDB_CMD_RENAME, pszNew ) )
+			SendReply( VDB_CMD_RENAME, ksceIoRename( pszPath, pszNew ), 0 );
 		break;
 	}
 	case VDB_CMD_POWER:
@@ -532,8 +626,13 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 		CmdPoke( (SceUID)hdr.arg, pPayload, nPayload );
 		break;
 	case VDB_CMD_PROCINFO:
-		CmdProcInfo( hdr.arg ? (SceUID)hdr.arg : ScreenOwnerPid() );
+	{
+		SceUID pid = hdr.arg ? (SceUID)hdr.arg : ScreenOwnerPid();
+		if ( pid >= 0 && !UserPid( pid ) )
+			pid = VDB_ERR_NOT_USER;
+		CmdProcInfo( pid );
 		break;
+	}
 	case VDB_CMD_PROFILE:
 		CmdProfile( hdr.arg, pPayload, nPayload );
 		break;

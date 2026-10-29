@@ -349,6 +349,13 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		memcpy( &pid, pPayload, 4 );
 		memcpy( &us, pPayload + 4, 4 );
 		s_ProfPid = pid ? (SceUID)pid : ScreenOwnerPid();
+		// never the kernel: suspending its threads (this plugin's USB
+		// thread among them) would hang the Vita
+		if ( !UserPid( s_ProfPid ) )
+		{
+			SendReply( VDB_CMD_PROFILE, s_ProfPid < 0 ? s_ProfPid : VDB_ERR_NOT_USER, 0 );
+			return;
+		}
 		s_nProfInterval = us < 200 ? 200 : us > 100000 ? 100000 : us;
 		s_nProfThreads = 0;
 		s_nProfRounds = 0;
