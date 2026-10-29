@@ -62,6 +62,8 @@ python3 host/vdb.py reboot                    # cold reboot; `unlock` peels the 
 | `input ...`, `touch X Y`, `swipe X0 Y0 X1 Y1`, `unlock` | buttons, sticks, a finger (front or `--back`), the lock screen peel |
 | `osd "text"`, `osd off` | the on-screen display |
 | `kprintf on`, `kprintf off` | the kernel's and every app's printf output into the stream |
+| `fps [seconds]` | the frame rate of whatever is on screen, any game, counted in the display hook |
+| `get app0:path dst --pid P` | a file as a running app sees it: its `app0:`, with the update overlaid and the file-system encryption removed |
 | `awake off`, `awake standby`, `awake screen` | keep-awake while the bridge runs: off (default, the Vita sleeps and charges as usual), no automatic standby, or no standby and no screen off |
 | `ps`, `peek`, `poke` | the process on screen: threads and modules; its memory, read and written |
 | `profile [seconds]` | a sampling profile of the process on screen, resolved to functions |
@@ -126,6 +128,7 @@ Result on a Slim (firmware 3.65, SD2Vita, a Mac through a USB 2 hub), 0.8.3, 30 
 - **The charging indicator** stays off on a host port (ScePower's "is charging" needs Syscon's "power online"); `status` shows the real charging status.
 - **VitaShell's USB mode** is unavailable while the bridge holds the port: set `usb off` in `vdb.cfg` and reboot, or press L+R+Start+Select to hand the port back.
 - **The lock screen** after a boot turns the screen off and sends the Vita to standby within about a minute; `vdb.py unlock` peels it from the host.
+- **Installed games are encrypted on the card** (PFS). While a game runs, its `ux0:app` and `ux0:patch` folders show the decrypted view (no `sce_pfs` folder, directory sizes 0); otherwise the raw ciphertext. Never write into those folders from a copy taken in the other view: plain bytes where ciphertext belongs make the game hang at start. Modded files belong in `ux0:rePatch` (rePatch plugin), and `get --pid` reads the decrypted originals.
 - **Memory.** An idle vdb holds about 85 KB of kernel memory; the bridge adds a 580 KB DMA block the first time it takes the port, a profile between 120 KB and 1 MB while it runs (smaller when the kernel is short of memory, with fewer distinct addresses per thread before samples overflow), given back once the dump has been read.
 - **The status overlay** (L+R+Start+Up, or `osd status`) shows every marker the plugin has when the Mac sees nothing: USB state decoded, bridge and host state, the suspend window, the last receive error and the retake counters.
 

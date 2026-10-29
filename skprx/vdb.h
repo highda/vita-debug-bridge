@@ -28,6 +28,7 @@
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/io/dirent.h>
 #include <psp2kern/io/stat.h>
+#include <psp2kern/kernel/iofilemgr.h>
 #include <psp2kern/udcd.h>
 #include <psp2kern/ctrl.h>
 #include <psp2kern/power.h>
@@ -39,7 +40,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.9.2"
+#define VDB_VERSION		"0.9.5"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_AWAKE_FILE	VDB_DIR "awake"		// optional: "1" no standby, "2" no standby and no screen off, read at boot
@@ -87,7 +88,7 @@ enum
 	VDB_CMD_STATUS		= 2,	// reply payload: status text ("rx N" in it sizes the host's frames)
 	VDB_CMD_LIST		= 3,	// payload: dir path; reply frames: "d|f <size> <yyyy-mm-dd hh:mm:ss> <name>\n", final status = entry count
 	VDB_CMD_STAT		= 4,	// payload: path; reply: one such line
-	VDB_CMD_GET			= 5,	// payload: path; reply: 8-byte size, data frames, empty frame
+	VDB_CMD_GET			= 5,	// payload: path; arg: 0, or a pid to read through that process's mounts (a game's app0:, decrypted); reply: 8-byte size, data frames, empty frame
 	VDB_CMD_PUT_OPEN	= 6,	// payload: path (truncate/create); reply: status
 	VDB_CMD_PUT_DATA	= 7,	// payload: file data (no reply)
 	VDB_CMD_PUT_CLOSE	= 8,	// reply: status, payload 8-byte bytes written
@@ -228,6 +229,9 @@ void ProfileStop( void );
 void InstallDisplayHook( void );
 void RemoveDisplayHook( void );
 int OsdAvailable( void );
+void FpsTick( void );						// thread tick: frames presented per second, from the display hook
+unsigned FpsBusier( void );				// the busier framebuffer index: the app on screen
+unsigned FpsIndex( int i );				// per framebuffer index (0, 1)
 void OsdSet( const char *pszText );
 
 #endif // VDB_H

@@ -9,6 +9,7 @@
   vdb.py ls  ux0:data              list a directory (any device: ux0:, ur0:, uma0:, vs0:, os0: ...)
   vdb.py stat ux0:data/x.bin       one entry
   vdb.py get ux0:data/x.bin [dst]  copy a file from the Vita (dst defaults to the basename)
+  vdb.py get app0:path [dst] --pid P   a file as a running app sees it (its app0:, update overlaid, decrypted)
   vdb.py put src ux0:data/x.bin    copy a file to the Vita (created or truncated)
   vdb.py install game.vpk ABCD12345  write a VPK's files over an installed app (ux0:app/<id>/),
                                    no VitaShell; the title must already be installed once
@@ -26,6 +27,7 @@
   vdb.py touch X Y [--hold 100] [--back]   a finger on the front (or rear) panel, screen pixels 960x544
   vdb.py swipe X0 Y0 X1 Y1 [--ms 400] [--back]
   vdb.py kprintf on|off            mirror the kernel's own printf output into the log stream
+  vdb.py fps [SECONDS]             the foreground app's frame rate, from the display hook (any game)
   vdb.py awake off|standby|screen  keep-awake while the bridge runs: off (default, the Vita sleeps and charges as usual),
                                    standby (no automatic standby, the screen may go off), screen (nothing goes off)
   vdb.py ps [pid]                  a process (default: the one on screen): title, threads, modules
@@ -304,9 +306,9 @@ def cmd_ls(b, path):
         return
 
 
-def cmd_get(b, src, dst=None):
+def cmd_get(b, src, dst=None, pid=0):
     dst = dst or os.path.basename(src.split(":", 1)[-1].rstrip("/")) or "vdb.out"
-    b.send(CMD_GET, path_arg(src))
+    b.send(CMD_GET, path_arg(src), arg=pid & 0xFFFFFFFF)
     _, status, data = b.reply()
     check(status, f"get {src}")
     (size,) = struct.unpack("<Q", data[:8])
@@ -739,14 +741,41 @@ def main():
         print(f"pong in {(time.time() - t0) * 1000:.1f} ms")
     elif cmd == "status":
         sys.stdout.write(b.status_text)
+    elif cmd == "fps" and len(rest) <= 1:
+        # the foreground app's presented frames per second, from the plugin's
+        # display hook (0.9.4+), once a second, then min / average / max
+        seconds = int(rest[0]) if rest else 10
+        vals = []
+        for _ in range(seconds):
+            time.sleep(1)
+            status, data = b.simple(CMD_STATUS)
+            text = data.decode("utf-8", "replace")
+            if ", fps " in text:          # 0.9.5+: the busier framebuffer index
+                v = int(text.split(", fps ")[1].split()[0])
+            elif "fps app " in text:      # 0.9.4: "fps app A shell S", take the busier
+                parts = text.split("fps app ")[1].split()
+                v = max(int(parts[0]), int(parts[2]))
+            else:
+                sys.exit("fps: the plugin is older than 0.9.4 or its display hook is off")
+            vals.append(v)
+            print(f"{time.strftime('%H:%M:%S')} {v} fps", flush=True)
+        if vals:
+            print(f"min {min(vals)}  avg {sum(vals) / len(vals):.1f}  max {max(vals)} fps over {len(vals)} s")
     elif cmd == "ls" and len(rest) == 1:
         cmd_ls(b, rest[0])
     elif cmd == "stat" and len(rest) == 1:
         status, data = b.simple(CMD_STAT, path_arg(rest[0]))
         check(status, f"stat {rest[0]}")
         sys.stdout.write(data.decode("utf-8", "replace"))
-    elif cmd == "get" and len(rest) in (1, 2):
-        cmd_get(b, *rest)
+    elif cmd == "get" and 1 <= len(rest) <= 4:
+        # --pid P: read through that process's mounts (app0: of a running
+        # game, decrypted; "--pid 0" = the app on screen is not allowed, a
+        # pid is needed: see ps)
+        pid = opt_int(rest, "--pid", 0)
+        if len(rest) not in (1, 2):
+            print(__doc__)
+            return 1
+        cmd_get(b, *rest, pid=pid)
     elif cmd == "put" and len(rest) == 2:
         cmd_put(b, rest[0], rest[1])
     elif cmd == "install" and len(rest) == 2:

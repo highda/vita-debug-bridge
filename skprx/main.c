@@ -14,8 +14,8 @@ void StatusOsdTick( void )
 		return;
 	s_nLast = Uptime();
 	char text[6 * 64];
-	int n = snprintf( text, sizeof( text ), "vdb " VDB_VERSION " up %us batt %d%% %dmAh chg %d awake %d ring %u/%u sysw %us\n",
-		Uptime(), kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), kscePowerGetBatteryChargingStatus(), g_nAwakeMode, RingUsed(), RING_SIZE, SystemWritesSecondsLeft() );
+	int n = snprintf( text, sizeof( text ), "vdb " VDB_VERSION " fps %u up %us batt %d%% %dmAh chg %d awake %d ring %u/%u sysw %us\n",
+		FpsBusier(), Uptime(), kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), kscePowerGetBatteryChargingStatus(), g_nAwakeMode, RingUsed(), RING_SIZE, SystemWritesSecondsLeft() );
 	if ( n > 0 && n < (int)sizeof( text ) )
 		UsbStatusLines( text + n, sizeof( text ) - n );
 	OsdSet( text );
@@ -117,6 +117,7 @@ static int UsbThread( SceSize args, void *argp )
 			UsbSuspendTick();
 			SystemWritesTick();
 			UsbWatchdog();
+			FpsTick();
 			StatusOsdTick();
 			if ( nTicks % 5 == 0 )
 				UsbRetakeIfLost();

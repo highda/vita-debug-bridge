@@ -95,10 +95,22 @@ static void OsdDraw( const SceDisplayFrameBuf *pFb )
 // index-1 frame, the game's, dereferenced that NULL and powered the Vita
 // off.) The copy routine validates the destination itself, so an unexpected
 // framebuffer costs nothing more than a skipped row
+// Frames presented, per framebuffer index: every call here is one flip, so
+// the counts over a second are the frame rate of any game, with no help
+// from it. Which index a game uses is not fixed (Borderlands 2 presents on
+// 0, the shell's home screen on 1), so the busier of the two is "the" fps
+static volatile unsigned s_nFlips[2];
+static unsigned s_nFlipsLast[2], s_nFlipsAt;
+static unsigned s_nFps[2];
+
 static int Hook_ksceDisplaySetFrameBufInternal( int head, int index, const SceDisplayFrameBuf *pParam, int sync )
 {
-	if ( head && pParam && s_nOsdLines )
-		OsdDraw( pParam );
+	if ( head && pParam )
+	{
+		s_nFlips[index ? 1 : 0]++;
+		if ( s_nOsdLines )
+			OsdDraw( pParam );
+	}
 	return TAI_CONTINUE( int, s_DisplayRef, head, index, pParam, sync );
 }
 
@@ -113,6 +125,32 @@ void RemoveDisplayHook( void )
 	if ( s_DisplayHook >= 0 )
 		taiHookReleaseForKernel( s_DisplayHook, s_DisplayRef );
 	s_DisplayHook = -1;
+}
+
+// From the thread tick: the flips of the last whole second
+void FpsTick( void )
+{
+	unsigned now = Uptime();
+	if ( now == s_nFlipsAt )
+		return;
+	unsigned nSecs = now - s_nFlipsAt;
+	for ( int i = 0; i < 2; i++ )
+	{
+		unsigned n = s_nFlips[i];
+		s_nFps[i] = s_nFlipsAt ? ( n - s_nFlipsLast[i] ) / ( nSecs ? nSecs : 1 ) : 0;
+		s_nFlipsLast[i] = n;
+	}
+	s_nFlipsAt = now;
+}
+
+unsigned FpsBusier( void )
+{
+	return s_nFps[0] > s_nFps[1] ? s_nFps[0] : s_nFps[1];
+}
+
+unsigned FpsIndex( int i )
+{
+	return s_nFps[i ? 1 : 0];
 }
 
 int OsdAvailable( void )

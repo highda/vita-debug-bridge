@@ -161,18 +161,44 @@ static void CmdStat( const char *pszPath )
 }
 
 // GET: 8-byte size, then the file in reply-sized frames, then an empty frame
-static void CmdGet( const char *pszPath )
+// pid != 0: the file as that process sees it, through its own mounts. A
+// game's app0: is its installed files with the update overlaid and the
+// file-system encryption (PFS) already removed; the same files read from
+// ux0:patch directly are the encrypted bytes on the card
+static void CmdGet( const char *pszPath, SceUID pid )
 {
-	SceIoStat st;
-	memset( &st, 0, sizeof( st ) );
-	int r = ksceIoGetstat( pszPath, &st );
-	SceUID fd = r < 0 ? r : ksceIoOpen( pszPath, SCE_O_RDONLY, 0 );
-	if ( fd < 0 )
+	SceUID fd;
+	unsigned long long nSize;
+	if ( pid )
 	{
-		SendReply( VDB_CMD_GET, fd, 0 );
-		return;
+		if ( pid < 0 || !UserPid( pid ) )
+		{
+			SendReply( VDB_CMD_GET, pid < 0 ? pid : VDB_ERR_NOT_USER, 0 );
+			return;
+		}
+		fd = ksceIoOpenForPid( pid, pszPath, SCE_O_RDONLY, 0 );
+		if ( fd < 0 )
+		{
+			SendReply( VDB_CMD_GET, fd, 0 );
+			return;
+		}
+		long long nEnd = ksceIoLseek( fd, 0, SCE_SEEK_END );
+		ksceIoLseek( fd, 0, SCE_SEEK_SET );
+		nSize = nEnd < 0 ? 0 : (unsigned long long)nEnd;
 	}
-	unsigned long long nSize = (unsigned long long)st.st_size;
+	else
+	{
+		SceIoStat st;
+		memset( &st, 0, sizeof( st ) );
+		int r = ksceIoGetstat( pszPath, &st );
+		fd = r < 0 ? r : ksceIoOpen( pszPath, SCE_O_RDONLY, 0 );
+		if ( fd < 0 )
+		{
+			SendReply( VDB_CMD_GET, fd, 0 );
+			return;
+		}
+		nSize = (unsigned long long)st.st_size;
+	}
 	memcpy( ReplyPayload(), &nSize, 8 );
 	if ( SendReply( VDB_CMD_GET, 0, 8 ) < 0 )
 	{
@@ -462,10 +488,10 @@ static void CmdStatus( void )
 {
 	// "rx N" is read by the host to size its command frames
 	int n = snprintf( (char *)ReplyPayload(), ReplyCapacity(),
-		"vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x, awake %d, kprintf %s, system writes %s\n",
+		"vdb " VDB_VERSION ": ring %u used of %u, dropped %u, uptime %u s, put fd %d, rx %u, battery %d%% (%d mAh) %s, usb state 0x%x, awake %d, kprintf %s, system writes %s, fps %u (fb0 %u fb1 %u)\n",
 		RingUsed(), RING_SIZE, RingDropped(), Uptime(), (int)s_PutFd, UsbRxSize(),
 		kscePowerGetBatteryLifePercent(), kscePowerGetBatteryRemainCapacity(), ChargingText(),
-		(unsigned)ksceUdcdGetDeviceState(), g_nAwakeMode, KprintfCapturing() ? "on" : "off", SystemWritesSecondsLeft() ? "unlocked" : "locked" );
+		(unsigned)ksceUdcdGetDeviceState(), g_nAwakeMode, KprintfCapturing() ? "on" : "off", SystemWritesSecondsLeft() ? "unlocked" : "locked", FpsBusier(), FpsIndex( 0 ), FpsIndex( 1 ) );
 	SendReply( VDB_CMD_STATUS, 0, n > 0 ? n : 0 );
 }
 
@@ -539,7 +565,7 @@ void HandleCommand( unsigned char *pCmd, int nLen )
 		CmdStat( pszPath );
 		break;
 	case VDB_CMD_GET:
-		CmdGet( pszPath );
+		CmdGet( pszPath, (SceUID)hdr.arg );
 		break;
 	case VDB_CMD_PUT_OPEN:
 		if ( WriteAllowed( VDB_CMD_PUT_OPEN, pszPath ) )
