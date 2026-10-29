@@ -31,11 +31,15 @@
   vdb.py ps [pid]                  a process (default: the one on screen): title, threads, modules
   vdb.py peek ADDR LEN [--pid P] [-o file]   read process memory (hex dump, or to a file)
   vdb.py poke ADDR HEXBYTES [--pid P]        write process memory, e.g. poke 0x81001000 00112233
-  vdb.py profile [SECONDS] [--pid P] [--us 1000] [--raw file]
-                                   sample every thread's program counter, resolve against the
-                                   binaries in --build (default ./build) with
-                                   the load bases the launcher logged, print the hot functions
-  vdb.py autopsy [--elf f] [--all] pull the newest core dump and run vita-parse-core on it
+  vdb.py profile [SECONDS] [--pid P] [--us 1000] [--raw file] [--build DIR] [--elf F] [--log PATH]
+                                   sample every thread's program counter and print the hot
+                                   functions: addr2line against the ELFs found under --build
+                                   (--elf for the eboot's own), and, for apps that load .so
+                                   modules themselves, the "<name>.so: mapped text 0x<base>
+                                   size 0x<size>" lines of their log on the Vita (--log)
+  vdb.py autopsy --elf F [--all] [--out DIR] [--parser main.py]
+                                   pull the newest core dump (into --out, default ./cores) and
+                                   run vita-parse-core on it (--parser or $VITA_PARSE_CORE)
   vdb.py unlock                    peel the lock screen (a swipe from the top right corner)
   vdb.py osd "text" | off          text drawn over every frame (lines split at \\n, 8 x 110)
   vdb.py osd status                the plugin's status overlay (USB state, bridge, battery; hotkey L+R+Start+Up)
@@ -435,16 +439,19 @@ class ModuleMap:
     """Where things are loaded: the launcher's own log for the game's .so
     files (mapped by its loader, not the kernel) and ps for kernel modules."""
 
-    def __init__(self, b, build_dir):
+    def __init__(self, b, build_dir, log_path=None, eboot_elf=None):
         self.mods = []  # (base, end, name, elf, link_vaddr)
         self.build = build_dir
-        # the game libraries, from the launcher's boot log
-        try:
-            b.send(CMD_GET, path_arg("ux0:data/boot.txt"))
-            _, status, _ = b.reply()
-            text = read_frames(b, "boot log")[0].decode("utf-8", "replace") if status == 0 else ""
-        except SystemExit:
-            text = ""
+        self.eboot_elf = eboot_elf
+        # .so modules an app maps itself (so_loader style), from its own log
+        text = ""
+        if log_path:
+            try:
+                b.send(CMD_GET, path_arg(log_path))
+                _, status, _ = b.reply()
+                text = read_frames(b, "app log")[0].decode("utf-8", "replace") if status == 0 else ""
+            except SystemExit:
+                text = ""
         import re
         seen = {}
         for m in re.finditer(r"^(\S+\.so): mapped text 0x([0-9a-f]+) size 0x([0-9a-f]+)", text, re.M):
@@ -460,7 +467,7 @@ class ModuleMap:
                 base, size = int(base, 16), int(size, 16)
                 elf, link = (None, 0)
                 if path.endswith("eboot.bin"):
-                    elf = self.find_elf("eboot.elf")
+                    elf = self.eboot_elf
                     link = self.elf_text_vaddr(elf) if elf else 0
                 self.mods.append((base, base + size, name, elf, link))
         self.mods.sort()
@@ -493,7 +500,7 @@ class ModuleMap:
         return None, pc, None, 0
 
 
-def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
+def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None, log_path=None, eboot_elf=None):
     import subprocess
     b.send(CMD_PROFILE, struct.pack("<II", pid & 0xFFFFFFFF, us), arg=1)
     _, status, _ = b.reply()
@@ -508,7 +515,7 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
     text = text.decode("utf-8", "replace")
     if raw_out:
         open(raw_out, "w").write(text)
-    mm = ModuleMap(b, build_dir)
+    mm = ModuleMap(b, build_dir, log_path, eboot_elf)
     threads, cur = [], None
     rounds, elapsed_us = 0, 0
     for line in text.splitlines():
@@ -587,9 +594,11 @@ def cmd_profile(b, seconds, pid, us, build_dir, raw_out=None):
             print(f"  {100.0 * count / max(t['running'], 1):5.1f}%  {sym}")
 
 
-def cmd_autopsy(b, elf, all_dumps=False):
+def cmd_autopsy(b, elf, all_dumps=False, cores_dir="cores", parser=None):
     import subprocess
-    cores_dir = os.path.expanduser("~/code-projects/vita-logs/cores")
+    parser = parser or os.environ.get("VITA_PARSE_CORE")
+    if not parser or not os.path.exists(parser):
+        sys.exit("autopsy: needs vita-parse-core's main.py (--parser or $VITA_PARSE_CORE; https://github.com/xyzz/vita-parse-core)")
     os.makedirs(cores_dir, exist_ok=True)
     b.send(CMD_LIST, path_arg("ux0:data/"))
     text, _ = read_frames(b, "ls")
@@ -607,7 +616,6 @@ def cmd_autopsy(b, elf, all_dumps=False):
         if not os.path.exists(local) or os.path.getsize(local) != size:
             print(f"pulling {name} ({size} bytes, {when})", file=sys.stderr)
             cmd_get(b, "ux0:data/" + name, local)
-        parser = os.path.expanduser("~/code-projects/vita-refs/vita-parse-core/main.py")
         print(f"=== {name} ({when})")
         r = subprocess.run([sys.executable, parser, local, elf], capture_output=True, text=True)
         print(r.stdout[-6000:] if r.returncode == 0 else (r.stdout[-2000:] + r.stderr[-2000:]))
@@ -729,13 +737,19 @@ def main():
     elif cmd == "profile":
         pid = opt_int(rest, "--pid", 0)
         us = opt_int(rest, "--us", 1000)
-        build = rest[rest.index("--build") + 1] if "--build" in rest else os.path.expanduser("./build")
+        build = rest[rest.index("--build") + 1] if "--build" in rest else None
+        log_path = rest[rest.index("--log") + 1] if "--log" in rest else None
+        eboot_elf = rest[rest.index("--elf") + 1] if "--elf" in rest else None
         raw = rest[rest.index("--raw") + 1] if "--raw" in rest else None
         seconds = int(rest[0]) if rest and rest[0].isdigit() else 10
-        cmd_profile(b, seconds, pid, us, build, raw)
+        cmd_profile(b, seconds, pid, us, build, raw, log_path, eboot_elf)
     elif cmd == "autopsy":
-        elf = rest[rest.index("--elf") + 1] if "--elf" in rest else os.path.expanduser("./build/eboot.elf")
-        cmd_autopsy(b, elf, "--all" in rest)
+        if "--elf" not in rest:
+            sys.exit("autopsy: --elf <the crashed app's ELF> is needed to symbolize the dump")
+        elf = rest[rest.index("--elf") + 1]
+        out = rest[rest.index("--out") + 1] if "--out" in rest else "cores"
+        parser = rest[rest.index("--parser") + 1] if "--parser" in rest else None
+        cmd_autopsy(b, elf, "--all" in rest, out, parser)
     elif cmd == "awake" and len(rest) == 1 and rest[0] in AWAKE_MODES:
         b.send(CMD_AWAKE, arg=AWAKE_MODES[rest[0]])
         _, status, _ = b.reply()
