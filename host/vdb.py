@@ -90,7 +90,7 @@ TIMEOUT = 5000
 def open_device(interface, may_configure=True):
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if dev is None:
-        sys.exit("no vdb device (Vita not connected, plugin idle, or usb_on flag missing)")
+        sys.exit("no vdb device (Vita not connected, asleep, or the plugin idle: usb off in ux0:vdbplugin/vdb.cfg)")
     # after a re-enumeration (the Vita retakes the port after an app launch)
     # the device can sit unconfigured, and every bulk write then fails with an
     # I/O error: make sure configuration 1 is selected
@@ -228,6 +228,7 @@ def logs(stamp=False, path=None):
     buf = b""
     out = open(path, "a") if path else None
     last_data = time.time()
+    seen, last_complaint = None, 0.0
 
     def emit(line):
         if stamp:
@@ -240,12 +241,22 @@ def logs(stamp=False, path=None):
         if dev is None:
             while usb.core.find(idVendor=VID, idProduct=PID) is None:
                 time.sleep(1)
+                seen = None
+            if seen is None:
+                seen = time.time()
             time.sleep(2)  # a command client, if one is waiting, goes first
             try:
-                dev = open_device(0, may_configure=False)
-            except (usb.core.USBError, SystemExit):
+                # after 10 s nobody else has configured it: do it here, or the
+                # tail waits forever after every reboot and the ring's lines
+                # since then are lost
+                dev = open_device(0, may_configure=time.time() - seen > 10)
+            except (usb.core.USBError, SystemExit) as e:
+                if time.time() - last_complaint > 60:
+                    print(f"vdb: cannot attach yet ({e}), retrying", file=sys.stderr)
+                    last_complaint = time.time()
                 time.sleep(1)
                 continue
+            seen = None
             buf = b""
             last_data = time.time()
             print(f"vdb: attached {time.strftime('%H:%M:%S')}, waiting for log data (ctrl-c to stop)", file=sys.stderr)

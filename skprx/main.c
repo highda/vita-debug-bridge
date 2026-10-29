@@ -156,6 +156,131 @@ static int UsbThread( SceSize args, void *argp )
 //-----------------------------------------------------------------------------
 // Module entry
 //-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+// Configuration: ux0:vdbplugin/vdb.cfg, one setting per line, read at boot
+// from top to bottom, so a later line overrides an earlier one. "#" starts
+// a comment; unknown or malformed lines are ignored and noted in boot.txt.
+//   usb on|off                take the USB port once the shell is up
+//   awake off|standby|screen  keep-awake (also 0|1|2)
+//   hooks on|off              touch, display and printf hooks at once
+//   touch on|off, display on|off, printf on|off   one hook each
+// Without vdb.cfg the single flag files of 0.8 and before still count
+// (usb_on, awake, nohooks); they go in a later version
+//-----------------------------------------------------------------------------
+static int ParseOnOff( const char *v, int *pOut )
+{
+	if ( !strcmp( v, "on" ) || !strcmp( v, "1" ) || !strcmp( v, "yes" ) || !strcmp( v, "true" ) )
+		*pOut = 1;
+	else if ( !strcmp( v, "off" ) || !strcmp( v, "0" ) || !strcmp( v, "no" ) || !strcmp( v, "false" ) )
+		*pOut = 0;
+	else
+		return 0;
+	return 1;
+}
+
+static int FileExists( const char *pszPath )
+{
+	SceUID fd = ksceIoOpen( pszPath, SCE_O_RDONLY, 0 );
+	if ( fd < 0 )
+		return 0;
+	ksceIoClose( fd );
+	return 1;
+}
+
+static void ReadConfig( VdbConfig_t *c )
+{
+	c->bUsb = 0;
+	c->nAwake = 0;
+	c->bTouch = c->bDisplay = c->bPrintf = 1;
+	static char s_Text[4096];
+	SceUID fd = ksceIoOpen( VDB_CONFIG_FILE, SCE_O_RDONLY, 0 );
+	if ( fd < 0 )
+	{
+		// the 0.8 flag files
+		c->bUsb = FileExists( VDB_FLAG_FILE );
+		if ( FileExists( VDB_NOHOOKS_FILE ) )
+			c->bTouch = c->bDisplay = c->bPrintf = 0;
+		SceUID fa = ksceIoOpen( VDB_AWAKE_FILE, SCE_O_RDONLY, 0 );
+		if ( fa >= 0 )
+		{
+			char ch = 0;
+			if ( ksceIoRead( fa, &ch, 1 ) == 1 && ch >= '0' && ch <= '2' )
+				c->nAwake = ch - '0';
+			ksceIoClose( fa );
+		}
+		FileNotef( "vdb: no " VDB_CONFIG_FILE ", the old flag files: usb %s, awake %d, hooks %s", c->bUsb ? "on" : "off", c->nAwake, c->bTouch ? "on" : "off" );
+		return;
+	}
+	int n = ksceIoRead( fd, s_Text, sizeof( s_Text ) - 1 );
+	ksceIoClose( fd );
+	if ( n < 0 )
+		n = 0;
+	s_Text[n] = 0;
+	int nLine = 0;
+	for ( char *p = s_Text; *p; )
+	{
+		char *pEnd = p;
+		while ( *pEnd && *pEnd != '\n' )
+			pEnd++;
+		int bMore = *pEnd != 0;
+		*pEnd = 0;
+		nLine++;
+		char *pHash = strchr( p, '#' );
+		if ( pHash )
+			*pHash = 0;
+		// two words: key and value ("key value" or "key=value"), lower-cased
+		char key[16], val[16];
+		unsigned k = 0, v = 0;
+		char *q = p;
+		while ( *q == ' ' || *q == '\t' || *q == '\r' )
+			q++;
+		while ( *q && *q != ' ' && *q != '\t' && *q != '=' && *q != '\r' && k < sizeof( key ) - 1 )
+			key[k++] = ( *q >= 'A' && *q <= 'Z' ) ? *q + 32 : *q, q++;
+		key[k] = 0;
+		while ( *q == ' ' || *q == '\t' || *q == '=' )
+			q++;
+		while ( *q && *q != ' ' && *q != '\t' && *q != '\r' && v < sizeof( val ) - 1 )
+			val[v++] = ( *q >= 'A' && *q <= 'Z' ) ? *q + 32 : *q, q++;
+		val[v] = 0;
+		while ( *q == ' ' || *q == '\t' || *q == '\r' )
+			q++;
+		if ( k )
+		{
+			int b = 0, ok = 1;
+			if ( *q )
+				ok = 0;	// a third word
+			else if ( !strcmp( key, "usb" ) && ParseOnOff( val, &b ) )
+				c->bUsb = b;
+			else if ( !strcmp( key, "awake" ) )
+			{
+				if ( !strcmp( val, "off" ) || !strcmp( val, "0" ) )
+					c->nAwake = 0;
+				else if ( !strcmp( val, "standby" ) || !strcmp( val, "1" ) )
+					c->nAwake = 1;
+				else if ( !strcmp( val, "screen" ) || !strcmp( val, "2" ) )
+					c->nAwake = 2;
+				else
+					ok = 0;
+			}
+			else if ( !strcmp( key, "hooks" ) && ParseOnOff( val, &b ) )
+				c->bTouch = c->bDisplay = c->bPrintf = b;
+			else if ( !strcmp( key, "touch" ) && ParseOnOff( val, &b ) )
+				c->bTouch = b;
+			else if ( !strcmp( key, "display" ) && ParseOnOff( val, &b ) )
+				c->bDisplay = b;
+			else if ( !strcmp( key, "printf" ) && ParseOnOff( val, &b ) )
+				c->bPrintf = b;
+			else
+				ok = 0;
+			if ( !ok )
+				FileNotef( "vdb: " VDB_CONFIG_FILE " line %d ignored: %s", nLine, p );
+		}
+		p = bMore ? pEnd + 1 : pEnd;
+	}
+	FileNotef( "vdb: " VDB_CONFIG_FILE ": usb %s, awake %d, touch %s, display %s, printf %s", c->bUsb ? "on" : "off", c->nAwake,
+		c->bTouch ? "on" : "off", c->bDisplay ? "on" : "off", c->bPrintf ? "on" : "off" );
+}
+
 void _start() __attribute__(( weak, alias( "module_start" ) ));
 int module_start( SceSize argc, const void *args )
 {
@@ -175,44 +300,25 @@ int module_start( SceSize argc, const void *args )
 		ksceKernelDeleteEventFlag( g_Evf );
 		return SCE_KERNEL_START_FAILED;
 	}
-	// ux0:vdbplugin/nohooks: the bridge without any hook in other code paths
-	// (touch readers, the display, the kernel's printf), to tell a conflict
-	// with a game or another plugin apart from the USB side
-	SceUID fdNoHooks = ksceIoOpen( VDB_NOHOOKS_FILE, SCE_O_RDONLY, 0 );
-	if ( fdNoHooks >= 0 )
-	{
-		ksceIoClose( fdNoHooks );
-		FileNote( "vdb: nohooks flag: touch, display and printf hooks not installed\n" );
-	}
-	else
-	{
+	VdbConfig_t cfg;
+	ReadConfig( &cfg );
+	if ( cfg.bTouch )
 		InstallInputHooks();
+	if ( cfg.bDisplay )
 		InstallDisplayHook();
+	if ( cfg.bPrintf )
 		InstallKprintfCapture();
-	}
+	if ( !cfg.bTouch || !cfg.bDisplay || !cfg.bPrintf )
+		FileNotef( "vdb: hooks: touch %s, display %s, printf %s", cfg.bTouch ? "on" : "off", cfg.bDisplay ? "on" : "off", cfg.bPrintf ? "on" : "off" );
 	UsbInstallSuspendHandler();
-
-	// decide the auto start before the thread runs (it once read the flag
-	// before module_start set it: the takeover never happened)
-	SceUID fdFlag = ksceIoOpen( VDB_FLAG_FILE, SCE_O_RDONLY, 0 );
-	if ( fdFlag >= 0 )
-	{
-		ksceIoClose( fdFlag );
-		s_bAutoStart = 1;
-	}
-	// the keep-awake mode can be preset on the card (vdb.py awake sets it per boot)
-	SceUID fdAwake = ksceIoOpen( VDB_AWAKE_FILE, SCE_O_RDONLY, 0 );
-	if ( fdAwake >= 0 )
-	{
-		char ch = 0;
-		if ( ksceIoRead( fdAwake, &ch, 1 ) == 1 && ch >= '0' && ch <= '2' )
-			g_nAwakeMode = ch - '0';
-		ksceIoClose( fdAwake );
-	}
+	// decided before the thread runs (it once read the flag before
+	// module_start set it: the takeover never happened)
+	s_bAutoStart = cfg.bUsb;
+	g_nAwakeMode = cfg.nAwake;
 	int st = ksceKernelStartThread( s_Thread, 0, NULL );
 	FileNotef( "vdb " VDB_VERSION ": loaded, thread 0x%08x start 0x%08x, usb %s", (unsigned)s_Thread, st,
-		s_bAutoStart ? "start scheduled after the shell is up" : "idle (no usb_on flag)" );
-	Log( s_bAutoStart ? "vdb: usb start scheduled for after boot" : "vdb: usb idle (no " VDB_FLAG_FILE ")" );
+		s_bAutoStart ? "start scheduled after the shell is up" : "idle (usb off in the config)" );
+	Log( s_bAutoStart ? "vdb: usb start scheduled for after boot" : "vdb: usb idle (usb off in " VDB_CONFIG_FILE ")" );
 	return SCE_KERNEL_START_SUCCESS;
 }
 

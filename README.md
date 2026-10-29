@@ -78,12 +78,21 @@ Developing on real hardware with only a memory card for feedback means: play, qu
 
 ## Install (firmware 3.65, HENkaku/Enso, taiHEN)
 
-1. Copy `dist/vdbplugin/` to `ux0:vdbplugin/` (it holds `vdb.skprx`, an empty `usb_on` flag and a README).
+1. Copy `dist/vdbplugin/` to `ux0:vdbplugin/` (it holds `vdb.skprx`, the configuration `vdb.cfg`, the shell companion and a README).
 2. Add `ux0:vdbplugin/vdb.skprx` under `*KERNEL` in `ur0:tai/config.txt` (or `ux0:tai/config.txt` if that is what your setup uses). On an SD2Vita setup put it after `storagemgr.skprx`. For `launch` and `kill`, also add `ux0:vdbplugin/vdb_shell.suprx` under `*main`, after `henkaku.suprx`.
 3. Reboot. About 25 s after boot, once the shell's own USB driver is up, the plugin takes the USB port.
 4. On the computer (needs libusb and pyusb): `python3 host/vdb.py logs`, then `ping`, `status`, `ls ux0:` or `get ux0:data/some.log` from another terminal.
 
-`usb_on` is the switch: delete it and reboot to get normal USB (VitaShell storage, Content Manager) back; the plugin stays loaded but idle, and the hotkey can still switch it on. Recovery from a bad plugin build: hold **L** while the Vita boots to skip all taiHEN plugins.
+`ux0:vdbplugin/vdb.cfg` is read at boot, one setting per line; a later line overrides an earlier one, and unknown or malformed lines are ignored with a note in `boot.txt`:
+
+```
+usb on            # take the USB port once the shell is up; off leaves it to the system (VitaShell storage, Content Manager), the hotkey can still switch it on
+awake off         # keep-awake while the bridge runs: off | standby | screen
+hooks on          # touch injection, the overlay and printf capture at once
+touch off         # or one by one: touch, display, printf
+```
+
+Without `vdb.cfg`, the single flag files of 0.8 (`usb_on`, `awake`, `nohooks`) still count; they will go in a later version. Turning hooks off is the way to rule vdb's hooks out when a game or another plugin misbehaves. Recovery from a bad plugin build: hold **L** while the Vita boots to skip all taiHEN plugins.
 
 ## Using it from your own app
 
@@ -95,7 +104,7 @@ VitaSDK: `make` in `skprx/` builds `vdb.skprx` (main.c: thread and module entry;
 
 ## Safety
 
-The bridge is a privileged channel: whoever holds the other end of the cable can read and write files, read and change the memory of running apps, press buttons and power the Vita off. It is a development tool for your own Vita; take it out of `config.txt` (or delete `ux0:vdbplugin/usb_on`) on a console you lend or sell. What the plugin itself enforces:
+The bridge is a privileged channel: whoever holds the other end of the cable can read and write files, read and change the memory of running apps, press buttons and power the Vita off. It is a development tool for your own Vita; take it out of `config.txt` (or set `usb off` in `vdb.cfg`) on a console you lend or sell. What the plugin itself enforces:
 
 - **System partitions are write-protected from the host.** Writes, removals, renames and new folders outside the user storage devices (`ux0:`, `uma0:`, `imc0:`, `xmc0:`) are refused unless they are unlocked on the Vita itself with `L + R + Start + Down`, for two minutes (the overlay and `status` show it). A host alone cannot break `ur0:tai/config.txt` or the system data partitions; reads stay free, and the firmware partitions refuse writes anyway.
 - **Process commands only reach user processes.** `peek`, `poke`, `ps` and `profile` refuse the kernel's own process: kernel memory is never read or written, and the profiler never suspends kernel threads (its own USB thread among them). Address ranges that wrap are refused.
@@ -115,7 +124,8 @@ Result on a Slim (firmware 3.65, SD2Vita, a Mac through a USB 2 hub), 0.8.3, 30 
 - **The Mac asleep** puts the bus into USB suspend: the Vita stops charging from it (a suspended device may draw almost nothing) and the bridge resumes by itself when the Mac wakes.
 - **500 mA.** A host port grants 500 mA and nothing on the Vita asks for more; a game draws more than that. Charge with the screen off, or from a charger.
 - **The charging indicator** stays off on a host port (ScePower's "is charging" needs Syscon's "power online"); `status` shows the real charging status.
-- **VitaShell's USB mode** is unavailable while the bridge holds the port: delete `ux0:vdbplugin/usb_on` and reboot, or press L+R+Start+Select to hand the port back.
+- **VitaShell's USB mode** is unavailable while the bridge holds the port: set `usb off` in `vdb.cfg` and reboot, or press L+R+Start+Select to hand the port back.
+- **The lock screen** after a boot turns the screen off and sends the Vita to standby within about a minute; `vdb.py unlock` peels it from the host.
 - **Memory.** An idle vdb holds about 85 KB of kernel memory; the bridge adds a 580 KB DMA block the first time it takes the port, a profile about 1 MB the first time it runs (kept until reboot). Profile a game that is short of memory with that in mind.
 - **The status overlay** (L+R+Start+Up, or `osd status`) shows every marker the plugin has when the Mac sees nothing: USB state decoded, bridge and host state, the suspend window, the last receive error and the retake counters.
 
