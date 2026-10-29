@@ -112,6 +112,7 @@ static int UsbThread( SceSize args, void *argp )
 					ksceKernelPowerTick( SCE_KERNEL_POWER_TICK_DEFAULT );
 			}
 			InputTick();
+			UsbSuspendTick();
 			UsbWatchdog();
 			StatusOsdTick();
 			if ( nTicks % 5 == 0 )

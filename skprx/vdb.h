@@ -39,7 +39,7 @@
 
 #define VDB_DRIVER_NAME	"VDB"
 #define VDB_USB_PID		0x0DB6
-#define VDB_VERSION		"0.7.7"
+#define VDB_VERSION		"0.7.8"
 #define VDB_DIR			"ux0:vdbplugin/"
 #define VDB_FLAG_FILE	VDB_DIR "usb_on"
 #define VDB_AWAKE_FILE	VDB_DIR "awake"		// optional: "1" no standby, "2" no standby and no screen off, read at boot
@@ -172,6 +172,7 @@ int kscePowerGetBatteryChargingStatus( void );	// not in this SDK header (NID in
 void UsbRetakeIfLost( void );			// the system took the port (an app launch): take it back
 void UsbInstallSuspendHandler( void );	// standby: hands off during the system's suspend, retakes after resume
 int UsbSuspended( void );				// the system is between suspend and resume
+void UsbSuspendTick( void );			// thread tick: notes the window, clears an abandoned one
 const char *UsbSuspendNotes( void );	// the last suspend/resume event ids, for the log
 void UsbStatusLines( char *pBuf, unsigned nSize );	// three lines of USB state for the status overlay
 void UsbRetakeReset( void );			// an explicit start (hotkey, host) clears the give-up

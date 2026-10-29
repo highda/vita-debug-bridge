@@ -157,8 +157,13 @@ void UsbWatchdog( void )
 	// after such a failure: the same path as an attach
 	if ( s_bLostByRecv && g_bActive && !g_bHostAttached )
 	{
+		// (not when the system's own device took the port: an app's exit
+		// fails our receive the same way, and the connection that is then
+		// established is the system's; the retake handles that case)
 		unsigned st = (unsigned)ksceUdcdGetDeviceState();
-		if ( ( st & SCE_UDCD_STATUS_CONNECTION_ESTABLISHED ) && !( st & SCE_UDCD_STATUS_CONNECTION_SUSPENDED ) && ( st & SCE_UDCD_STATUS_CABLE_CONNECTED ) )
+		int mtp = ksceUdcdGetDrvState( "USB_MTP_Driver" );
+		if ( ( st & SCE_UDCD_STATUS_CONNECTION_ESTABLISHED ) && !( st & SCE_UDCD_STATUS_CONNECTION_SUSPENDED ) && ( st & SCE_UDCD_STATUS_CABLE_CONNECTED )
+			&& !( mtp & SCE_UDCD_STATUS_ACTIVATED ) )
 		{
 			s_bLostByRecv = 0;
 			FileNotef( "vdb: bus established again after a failed receive (usb state 0x%x, uptime %u s), resuming", st, Uptime() );
@@ -291,6 +296,31 @@ int UsbSuspended( void )
 		Log( "vdb: resumed from standby (%s), usb state 0x%x", s_SuspendNotes, (unsigned)ksceUdcdGetDeviceState() );
 	}
 	return s_bSuspended;
+}
+
+// From the thread's 200 ms tick. The thread does not run while the system
+// is really suspended, so a mark it keeps seeing for 25 of its own ticks
+// with no resume event is a suspend the system started and abandoned (a
+// standby that a USB event cut short, say): left set, it blocked every
+// retake, and the bridge was lost when an app's exit took the port
+void UsbSuspendTick( void )
+{
+	static unsigned s_nTicks;
+	if ( !s_bSuspended || s_nResumeEvent )
+	{
+		s_nTicks = 0;
+		return;
+	}
+	if ( s_nTicks++ == 0 )
+		FileNotef( "vdb: suspend window open (event 0x%x, uptime %u s, usb state 0x%x)", s_nSuspendEvent, Uptime(), (unsigned)ksceUdcdGetDeviceState() );
+	else if ( s_nTicks > 25 )
+	{
+		s_bSuspended = 0;
+		s_nTicks = 0;
+		snprintf( s_SuspendNotes, sizeof( s_SuspendNotes ), "suspend 0x%x abandoned", s_nSuspendEvent );
+		FileNotef( "vdb: suspend 0x%x abandoned, no resume event in 5 s of running (uptime %u s, usb state 0x%x)", s_nSuspendEvent, Uptime(), (unsigned)ksceUdcdGetDeviceState() );
+		Log( "vdb: suspend 0x%x abandoned by the system, retake check back on", s_nSuspendEvent );
+	}
 }
 
 const char *UsbSuspendNotes( void )
