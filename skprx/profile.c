@@ -88,7 +88,7 @@ void CmdProcInfo( SceUID pid )
 // state is recorded with each thread
 //-----------------------------------------------------------------------------
 #define PROF_THREADS	12
-#define PROF_BUCKETS	4096	// per thread, power of two
+#define PROF_BUCKETS	4096	// per thread at most, power of two; fewer when kernel memory is short (see CmdProfile)
 typedef struct
 {
 	unsigned pc, lr, ra, ra2, count;	// lr: the return address, so the host attributes a sample in a syscall stub to its caller;
@@ -101,12 +101,13 @@ typedef struct
 	char name[32];
 	unsigned nSamples, nRunning, nOverflow;
 	unsigned long long nRunUs0, nRunUs1;	// the kernel's run clock at the first and the last sample: the real CPU time
-	ProfBucket_t buckets[PROF_BUCKETS];
+	ProfBucket_t *buckets;	// s_nBuckets of them, in the same block
 } ProfThread_t;
 
 // about 1 MB: allocated when a profile first starts, not at load (see usb.c)
 static ProfThread_t *s_Prof;
 static SceUID s_ProfBlock = -1;
+static unsigned s_nBuckets;
 static int s_nProfThreads;
 static SceUID s_ProfPid = -1, s_ProfThread = -1;
 static volatile int s_bProfRun;
@@ -129,7 +130,10 @@ static ProfThread_t *ProfSlot( SceUID thid )
 	if ( s_nProfThreads >= PROF_THREADS )
 		return NULL;
 	ProfThread_t *p = &s_Prof[s_nProfThreads++];
+	ProfBucket_t *pBuckets = p->buckets;	// the slot's own bucket array, kept across the reset
 	memset( p, 0, sizeof( *p ) );
+	p->buckets = pBuckets;
+	memset( pBuckets, 0, sizeof( ProfBucket_t ) * s_nBuckets );
 	p->thid = thid;
 	SceKernelThreadInfo info;
 	memset( &info, 0, sizeof( info ) );
@@ -149,7 +153,7 @@ static void ProfCount( ProfThread_t *p, unsigned pc, unsigned lr, unsigned ra, u
 	unsigned h = ( ( pc >> 1 ) ^ ( lr << 7 ) ) * 2654435761u;
 	for ( unsigned i = 0; i < 16; i++ )
 	{
-		ProfBucket_t *b = &p->buckets[( h + i ) & ( PROF_BUCKETS - 1 )];
+		ProfBucket_t *b = &p->buckets[( h + i ) & ( s_nBuckets - 1 )];
 		if ( b->count == 0 )
 		{
 			b->pc = pc;
@@ -352,15 +356,37 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		memcpy( &us, pPayload + 4, 4 );
 		if ( !s_Prof )
 		{
-			unsigned nBytes = ( sizeof( ProfThread_t ) * PROF_THREADS + 0xFFF ) & ~0xFFFu;
-			s_ProfBlock = ksceKernelAllocMemBlock( "vdb_prof", 0x1020D006, nBytes, NULL );
+			// The full table is about 1 MB; a game short of memory (one
+			// refused it while running) gets a smaller one: fewer distinct
+			// (pc, lr) pairs per thread before samples overflow, down to
+			// about 120 KB
 			void *pBase = NULL;
-			if ( s_ProfBlock < 0 || ksceKernelGetMemBlockBase( s_ProfBlock, &pBase ) < 0 || !pBase )
+			int r = -1;
+			for ( unsigned n = PROF_BUCKETS; n >= 512; n /= 2 )
 			{
-				SendReply( VDB_CMD_PROFILE, s_ProfBlock < 0 ? s_ProfBlock : -1, 0 );
+				unsigned nBytes = ( sizeof( ProfThread_t ) * PROF_THREADS + sizeof( ProfBucket_t ) * n * PROF_THREADS + 0xFFF ) & ~0xFFFu;
+				s_ProfBlock = ksceKernelAllocMemBlock( "vdb_prof", 0x1020D006, nBytes, NULL );
+				if ( s_ProfBlock >= 0 && ksceKernelGetMemBlockBase( s_ProfBlock, &pBase ) >= 0 && pBase )
+				{
+					s_nBuckets = n;
+					break;
+				}
+				r = s_ProfBlock;
+				if ( s_ProfBlock >= 0 )
+					ksceKernelFreeMemBlock( s_ProfBlock );
+				s_ProfBlock = -1;
+				pBase = NULL;
+			}
+			if ( !pBase )
+			{
+				SendReply( VDB_CMD_PROFILE, r < 0 ? r : -1, 0 );
 				return;
 			}
 			s_Prof = (ProfThread_t *)pBase;
+			ProfBucket_t *pBuckets = (ProfBucket_t *)( s_Prof + PROF_THREADS );
+			for ( int t = 0; t < PROF_THREADS; t++ )
+				s_Prof[t].buckets = pBuckets + t * s_nBuckets;
+			Log( "vdb: profiler table: %u buckets per thread (%u KB)", s_nBuckets, (unsigned)( ( sizeof( ProfThread_t ) + sizeof( ProfBucket_t ) * s_nBuckets ) * PROF_THREADS / 1024 ) );
 		}
 		s_ProfPid = pid ? (SceUID)pid : ScreenOwnerPid();
 		// never the kernel: suspending its threads (this plugin's USB
@@ -405,9 +431,19 @@ void CmdProfile( unsigned nAction, const unsigned char *pPayload, unsigned nPayl
 		ProfThread_t *p = &s_Prof[t];
 		if ( Emit( VDB_CMD_PROFILE, &nUsed, "T 0x%08x %u %u %u %u %s\n", (unsigned)p->thid, p->nSamples, p->nRunning, p->nOverflow, (unsigned)( p->nRunUs1 - p->nRunUs0 ), p->name ) < 0 )
 			return;
-		for ( int b = 0; b < PROF_BUCKETS; b++ )
+		for ( unsigned b = 0; b < s_nBuckets; b++ )
 			if ( p->buckets[b].count && Emit( VDB_CMD_PROFILE, &nUsed, "S %x %x %x %x %u\n", p->buckets[b].pc, p->buckets[b].lr, p->buckets[b].ra, p->buckets[b].ra2, p->buckets[b].count ) < 0 )
 				return;
 	}
 	Flush( VDB_CMD_PROFILE, &nUsed, 0 );
+	// the table goes back to the kernel once it has been read: held until
+	// reboot, its 120 KB to 1 MB are exactly what a large game is short of
+	// at load (a second dump of the same profile is then empty)
+	if ( s_ProfBlock >= 0 && s_ProfThread < 0 )
+	{
+		ksceKernelFreeMemBlock( s_ProfBlock );
+		s_ProfBlock = -1;
+		s_Prof = NULL;
+		s_nProfThreads = 0;
+	}
 }
